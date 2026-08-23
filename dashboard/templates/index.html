@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<!-- ============================================================
+  index.html —— 多AGV调度仿真 Web 看板（规格 6）
+  技术：原生 Canvas 画地图与 AGV 动画 + ECharts(CDN) 画统计图表
+  数据：500ms 轮询 /api/state；点击小车弹出详情（电量/任务/路径）
+============================================================ -->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>多AGV调度与交通管制仿真看板</title>
+<!-- ECharts 官方 CDN（首次打开需联网加载一次） -->
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<style>
+  /* ---------- 全局布局 ---------- */
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+         background: #0f172a; color: #e2e8f0; padding: 12px 16px; }
+  h1 { font-size: 20px; margin-bottom: 8px; color: #7dd3fc; }
+  .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+             margin-bottom: 10px; font-size: 13px; }
+  button { background: #1e293b; color: #e2e8f0; border: 1px solid #334155;
+           border-radius: 6px; padding: 5px 12px; cursor: pointer; font-size: 13px; }
+  button:hover { background: #334155; }
+  .stat-chip { background: #1e293b; border-radius: 6px; padding: 4px 10px;
+               border: 1px solid #334155; }
+  .main { display: flex; gap: 14px; align-items: stretch; }
+  .left { flex: 1.35; min-width: 0; }
+  .right { flex: 1; min-width: 380px; max-width: 520px;
+           display: flex; flex-direction: column; gap: 10px; }
+  .panel { background: #1e293b; border: 1px solid #334155; border-radius: 8px;
+           padding: 8px; }
+  .panel h3 { font-size: 14px; color: #94a3b8; margin-bottom: 6px; }
+  canvas#mapCanvas { width: 100%; background: #0b1222; border-radius: 6px;
+                     display: block; }
+  /* 图例 */
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px;
+            margin-top: 6px; color: #94a3b8; }
+  .legend span::before { content: "●"; margin-right: 4px; }
+  /* 任务表 */
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { padding: 3px 6px; text-align: left; border-bottom: 1px solid #334155; }
+  th { color: #94a3b8; }
+  /* 事件日志 */
+  .logbox { height: 200px; overflow-y: auto; font-size: 12px; line-height: 1.55; }
+  .logbox p { white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
+  .tag { display: inline-block; min-width: 34px; text-align: center;
+         border-radius: 4px; margin-right: 6px; padding: 0 4px; font-size: 11px; }
+  /* AGV 详情浮窗 */
+  #agvPopup { position: fixed; display: none; z-index: 50; width: 240px;
+              background: #0f172a; border: 1px solid #38bdf8; border-radius: 8px;
+              padding: 10px; font-size: 13px; box-shadow: 0 6px 24px #000; }
+  #agvPopup b { color: #7dd3fc; }
+  #agvPopup .close { float: right; cursor: pointer; color: #94a3b8; }
+  .chart { width: 100%; height: 170px; }
+</style>
+</head>
+<body>
+
+<h1>多 AGV 调度与交通管制仿真看板 <small style="font-size:12px;color:#64748b">（栅格离散仿真 · 调度层演示）</small></h1>
+
+<div class="toolbar">
+  <span class="stat-chip">仿真时刻：<b id="simTime">0</b>s</span>
+  <span class="stat-chip">待分配任务：<b id="pending">0</b></span>
+  <span class="stat-chip">完成：<b id="doneCnt">0</b></span>
+  <button id="btnPause">⏸ 暂停</button>
+  <!-- 站台呼叫按钮：走 Modbus HRk=1 链路 -->
+  <span style="color:#94a3b8">模拟站台呼叫：</span>
+  <button onclick="stationCall(0)">ST1</button>
+  <button onclick="stationCall(1)">ST2</button>
+  <button onclick="stationCall(2)">ST3</button>
+  <button onclick="stationCall(3)">ST4</button>
+  <span class="stat-chip" id="callTip" style="color:#7dd3fc"></span>
+</div>
+
+<div class="main">
+  <!-- ============ 左侧：Canvas 地图动画 ============ -->
+  <div class="left panel">
+    <h3>仓库栅格地图（30 × 20）—— 点击小车查看详情</h3>
+    <canvas id="mapCanvas"></canvas>
+    <div class="legend" id="legend"></div>
+  </div>
+
+  <!-- ============ 右侧：图表 + 表格 + 日志 ============ -->
+  <div class="right">
+    <div class="panel"><h3>吞吐曲线（累计完成任务数，每5s采样）</h3>
+      <div id="chartTp" class="chart"></div></div>
+    <div class="panel"><h3>平均任务响应时间（30s窗口均值，秒）</h3>
+      <div id="chartResp" class="chart"></div></div>
+    <div class="panel"><h3>车队电量分布（%）</h3>
+      <div id="chartBat" class="chart"></div></div>
+    <div class="panel"><h3>任务队列（最近 12 条）</h3>
+      <table><thead><tr><th>#</th><th>类型</th><th>起点→终点</th>
+        <th>状态</th><th>车</th><th>响应s</th></tr></thead>
+      <tbody id="taskBody"></tbody></table></div>
+    <div class="panel"><h3>事件日志（分配 / 让路 / 死锁 / 回充 / 故障）</h3>
+      <div class="logbox" id="logBox"></div></div>
+  </div>
+</div>
+
+<!-- AGV 详情浮窗 -->
+<div id="agvPopup">
+  <span class="close" onclick="hidePopup()">✕</span>
+  <div id="popupBody"></div>
+  <button id="btnResetFault" style="margin-top:8px;display:none"
+          onclick="resetFault()">🔧 故障复位（人工）</button>
+</div>
+
+<script>
+/* ================= 全局状态 ================= */
+let latest = null;              // 最近一次 /api/state 快照
+let renderPos = {};             // agvId -> {x,y} 渲染平滑位置
+let selectedAgv = null;         // 当前点选的车辆
+
+/* 状态 -> 颜色（与后端 AGV.state 字符串一一对应） */
+const STATE_COLOR = {
+  idle:       "#38bdf8",  // 空闲-蓝
+  to_pickup:  "#facc15",  // 接单去取货-黄
+  loading:    "#fb923c",  // 取货中-橙
+  to_deliver: "#f87171",  // 送货中-红
+  unloading:  "#f472b6",  // 放货中-粉
+  to_charge:  "#a78bfa",  // 低电回充-紫
+  charging:   "#34d399",  // 充电中-绿
+  fault:      "#ef4444"   // 故障-红黑闪烁
+};
+const STATE_LABEL = {
+  idle:"空闲", to_pickup:"接单-去取货", loading:"取货中",
+  to_deliver:"送货中", unloading:"放货中", to_charge:"低电回充",
+  charging:"充电中", fault:"故障待复位"
+};
+const KIND_COLOR = { task:"#38bdf8", assign:"#facc15", done:"#34d399",
+  reroute:"#fb923c", deadlock:"#f87171", charge:"#a78bfa",
+  fault:"#ef4444", info:"#94a3b8" };
+const KIND_LABEL = { task:"到达", assign:"分配", done:"完成", reroute:"让路",
+  deadlock:"死锁", charge:"回充", fault:"故障", info:"系统" };
+
+/* ================= 初始化图例与图表 ================= */
+const legendEl = document.getElementById("legend");
+for (const [k, v] of Object.entries(STATE_LABEL)) {
+  legendEl.innerHTML +=
+    `<span style="color:${STATE_COLOR[k]}">${v}</span>`;
+}
+const chartTp   = echarts.init(document.getElementById("chartTp"));
+const chartResp = echarts.init(document.getElementById("chartResp"));
+const chartBat  = echarts.init(document.getElementById("chartBat"));
+window.addEventListener("resize", () =>
+  [chartTp, chartResp, chartBat].forEach(c => c.resize()));
+
+function emptyAxisOpt() {
+  return {
+    grid: { left: 40, right: 10, top: 18, bottom: 22 },
+    xAxis: { type: "value", axisLabel: { color: "#64748b", fontSize: 10 },
+             splitLine: { show: false } },
+    yAxis: { type: "value", axisLabel: { color: "#64748b", fontSize: 10 } },
+    textStyle: { color: "#e2e8f0" }
+  };
+}
+
+/* ================= 轮询数据 ================= */
+async function poll() {
+  try {
+    const r = await fetch("/api/state");
+    latest = await r.json();
+    document.getElementById("simTime").textContent = latest.sim_time;
+    document.getElementById("pending").textContent = latest.pending;
+    document.getElementById("doneCnt").textContent =
+      latest.metrics.tasks_completed;
+    updateCharts(); updateTaskTable(); updateLog();
+  } catch (e) { /* 后端未就绪时静默重试 */ }
+}
+setInterval(poll, 500);
+poll();
+
+/* ================= ECharts 更新 ================= */
+function updateCharts() {
+  if (!latest) return;
+  const tp = latest.series.throughput.map(p => [p[0], p[1]]);
+  chartTp.setOption({ ...emptyAxisOpt(),
+    xAxis: { type: "value", name: "t/s", nameTextStyle:{color:"#64748b"},
+             axisLabel: { color: "#64748b", fontSize: 10 } },
+    series: [{ type: "line", data: tp, smooth: true, showSymbol: false,
+               areaStyle: { opacity: 0.15 }, itemStyle: { color: "#38bdf8" } }] });
+  const rp = latest.series.response.map(p => [p[0], p[1]]);
+  chartResp.setOption({ ...emptyAxisOpt(),
+    xAxis: { type: "value", name: "t/s", nameTextStyle:{color:"#64748b"},
+             axisLabel: { color: "#64748b", fontSize: 10 } },
+    series: [{ type: "line", data: rp, smooth: true, showSymbol: false,
+               itemStyle: { color: "#facc15" } }] });
+  const names = latest.agvs.map(a => "AGV" + a.id);
+  const vals  = latest.agvs.map(a => a.battery);
+  chartBat.setOption({
+    grid: { left: 46, right: 10, top: 14, bottom: 20 },
+    xAxis: { type: "value", max: 100,
+             axisLabel: { color: "#64748b", fontSize: 10 } },
+    yAxis: { type: "category", data: names,
+             axisLabel: { color: "#94a3b8", fontSize: 10 } },
+    series: [{ type: "bar", data: vals, barWidth: 10,
+               itemStyle: { color: p =>
+                 p.value < 20 ? "#ef4444" : p.value < 50 ? "#facc15" : "#34d399" } }],
+    textStyle: { color: "#e2e8f0" }
+  });
+}
+
+/* ================= 任务队列表 ================= */
+function updateTaskTable() {
+  if (!latest) return;
+  document.getElementById("taskBody").innerHTML = latest.tasks.map(t => `
+    <tr><td>${t.id}</td><td>${t.type_name}</td>
+    <td>(${t.src})→(${t.dst})</td><td>${t.state}</td>
+    <td>${t.agv_id ?? "-"}</td><td>${t.wait ?? "-"}</td></tr>`).join("");
+}
+
+/* ================= 事件日志 ================= */
+let lastLogLen = -1;
+function updateLog() {
+  if (!latest) return;
+  if (latest.events.length === lastLogLen) return;   // 无新事件不重绘
+  lastLogLen = latest.events.length;
+  document.getElementById("logBox").innerHTML = latest.events.slice().reverse()
+    .map(e => `<p><span class="tag" style="background:${
+        KIND_COLOR[e.kind] || "#334155"}33;color:${KIND_COLOR[e.kind] || "#ccc"
+        }">${KIND_LABEL[e.kind] || e.kind}</span>
+        <span style="color:#64748b">[${e.t}s]</span> ${e.msg}</p>`).join("");
+}
+
+/* ================= Canvas 地图渲染 ================= */
+const cv = document.getElementById("mapCanvas");
+const ctx = cv.getContext("2d");
+
+function drawMap() {
+  requestAnimationFrame(drawMap);
+  if (!latest) return;
+  const { cols, rows, grid } = latest.map;
+
+  // 自适应画布尺寸（只设一次）
+  if (cv.width !== cv.clientWidth * devicePixelRatio) {
+    cv.width = cv.clientWidth * devicePixelRatio;
+    cv.height = cv.clientWidth * rows / cols * devicePixelRatio;
+  }
+  const W = cv.width, H = cv.height;
+  const cell = Math.min(W / cols, H / rows);
+  const ox = (W - cell * cols) / 2, oy = (H - cell * rows) / 2;
+  ctx.clearRect(0, 0, W, H);
+
+  /* ---- 底图格子 ---- */
+  for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+    const px = ox + x * cell, py = oy + y * cell;
+    if (grid[y][x] === "#") {                    // 货架墙
+      ctx.fillStyle = "#243247";
+      ctx.fillRect(px + 1, py + 1, cell - 2, cell - 2);
+    } else {                                     // 巷道底色 + 细网格线
+      ctx.fillStyle = "#0b1222";
+      ctx.fillRect(px, py, cell, cell);
+      ctx.strokeStyle = "#16213a";
+      ctx.strokeRect(px + .5, py + .5, cell - 1, cell - 1);
+    }
+  }
+  /* ---- 站台（橙） 与 充电站（绿） ---- */
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  for (const s of latest.map.stations) {
+    const px = ox + s.x * cell, py = oy + s.y * cell;
+    ctx.fillStyle = "#7c3aed33"; ctx.strokeStyle = "#c084fc";
+    ctx.lineWidth = 2;
+    ctx.fillRect(px + 2, py + 2, cell - 4, cell - 4);
+    ctx.strokeRect(px + 2, py + 2, cell - 4, cell - 4);
+    ctx.fillStyle = "#e9d5ff"; ctx.font = `${cell*0.32}px sans-serif`;
+    ctx.fillText(s.id, px + cell/2, py + cell/2);
+  }
+  for (const c of latest.map.charges) {
+    const px = ox + c.x * cell, py = oy + c.y * cell;
+    ctx.fillStyle = "#05966933"; ctx.strokeStyle = "#34d399";
+    ctx.lineWidth = 2;
+    ctx.fillRect(px + 2, py + 2, cell - 4, cell - 4);
+    ctx.strokeRect(px + 2, py + 2, cell - 4, cell - 4);
+    ctx.fillStyle = "#a7f3d0"; ctx.font = `${cell*0.36}px sans-serif`;
+    ctx.fillText("⚡", px + cell/2, py + cell/2);
+  }
+
+  /* ---- 选中车的路径高亮 ---- */
+  if (selectedAgv) {
+    const a = latest.agvs.find(v => v.id === selectedAgv);
+    if (a && a.path.length) {
+      ctx.strokeStyle = "#38bdf8aa"; ctx.lineWidth = 2;
+      ctx.setLineDash([cell*0.3, cell*0.25]);
+      ctx.beginPath();
+      ctx.moveTo(ox + (a.cell[0]+.5)*cell, oy + (a.cell[1]+.5)*cell);
+      for (const [x,y] of a.path)
+        ctx.lineTo(ox + (x+.5)*cell, oy + (y+.5)*cell);
+      ctx.stroke(); ctx.setLineDash([]);
+    }
+  }
+
+  /* ---- AGV 本体（平滑插值移动） ---- */
+  const tNow = performance.now();
+  for (const a of latest.agvs) {
+    let rp = renderPos[a.id];
+    if (!rp) rp = renderPos[a.id] = { x: a.x, y: a.y };
+    // 指数趋近平滑：视觉上从旧位置滑向快照位置
+    const k = 0.18;
+    rp.x += (a.x - rp.x) * k;  rp.y += (a.y - rp.y) * k;
+    const px = ox + (rp.x + .5) * cell, py = oy + (rp.y + .5) * cell;
+
+    // 车体圆
+    ctx.beginPath();
+    ctx.arc(px, py, cell * 0.34, 0, Math.PI * 2);
+    ctx.fillStyle = STATE_COLOR[a.state] || "#999";
+    ctx.fill();
+    // 电量环（<20% 红色警示）
+    ctx.beginPath();
+    ctx.arc(px, py, cell * 0.42, -Math.PI/2,
+            -Math.PI/2 + Math.PI*2*(a.battery/100));
+    ctx.strokeStyle = a.battery < 20 ? "#ef4444" : "#4ade8088";
+    ctx.lineWidth = 2; ctx.stroke();
+    // 编号
+    ctx.fillStyle = "#0f172a"; ctx.font = `bold ${cell*0.3}px sans-serif`;
+    ctx.fillText(a.id, px, py + 1);
+    // 等待/故障提示圈
+    if (a.state === "fault" || a.waiting > 1) {
+      ctx.beginPath();
+      ctx.arc(px, py, cell*0.5 + Math.sin(tNow/180)*2, 0, Math.PI*2);
+      ctx.strokeStyle = "#ef4444"; ctx.lineWidth = 2; ctx.stroke();
+    }
+  }
+}
+requestAnimationFrame(drawMap);
+
+/* ================= 点击选车 & 详情浮窗 ================= */
+cv.addEventListener("click", ev => {
+  if (!latest) return;
+  const rect = cv.getBoundingClientRect();
+  const dpr = cv.width / rect.width;
+  const cx = (ev.clientX - rect.left) * dpr;
+  const cy = (ev.clientY - rect.top) * dpr;
+  const cols = latest.map.cols, rows = latest.map.rows;
+  const cell = Math.min(cv.width / cols, cv.height / rows);
+  const ox = (cv.width - cell*cols)/2, oy = (cv.height - cell*rows)/2;
+  let hit = null;
+  for (const a of latest.agvs) {
+    const px = ox + (renderPos[a.id]?.x + .5) * cell;
+    const py = oy + (renderPos[a.id]?.y + .5) * cell;
+    if ((px-cx)**2 + (py-cy)**2 < (cell*0.55)**2) hit = a.id;
+  }
+  selectedAgv = hit;
+  if (hit) showPopup(hit, ev.clientX, ev.clientY); else hidePopup();
+});
+
+function showPopup(id, mx, my) {
+  const a = latest.agvs.find(v => v.id === id);
+  if (!a) return;
+  document.getElementById("popupBody").innerHTML = `
+    <b>AGV ${a.id}</b>　<span style="color:${STATE_COLOR[a.state]}">${
+      a.state_name}</span><br>
+    电量：<b style="color:${a.battery<20?"#ef4444":"#4ade80"}">${a.battery}%</b><br>
+    逻辑格：(${a.cell})　朝向：(${a.facing})<br>
+    当前任务：${a.task_id ?? "无"}<br>
+    剩余路径：${a.path.length} 格${a.waiting > 0.5 ?
+      `<br><span style="color:#ef4444">已受阻等待 ${a.waiting}s</span>` : ""}`;
+  const btn = document.getElementById("btnResetFault");
+  btn.style.display = (a.state === "fault") ? "inline-block" : "none";
+  const pop = document.getElementById("agvPopup");
+  pop.style.left = Math.min(mx + 14, window.innerWidth - 260) + "px";
+  pop.style.top  = Math.min(my + 10, window.innerHeight - 190) + "px";
+  pop.style.display = "block";
+}
+function hidePopup() {
+  document.getElementById("agvPopup").style.display = "none";
+}
+
+/* ================= 工具栏动作 ================= */
+document.getElementById("btnPause").onclick = async () => {
+  await fetch("/api/pause", { method: "POST" });
+};
+async function stationCall(k) {
+  const r = await fetch(`/api/call/${k}`, { method: "POST" });
+  const j = await r.json();
+  document.getElementById("callTip").textContent =
+    j.ok ? `已呼叫 ST${k+1}（${j.via}）` : "呼叫失败";
+  setTimeout(() =>
+    document.getElementById("callTip").textContent = "", 2500);
+}
+async function resetFault() {
+  if (!selectedAgv) return;
+  await fetch(`/api/agv/${selectedAgv}/reset`, { method: "POST" });
+  hidePopup();
+}
+</script>
+</body>
+</html>
