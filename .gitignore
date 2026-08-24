@@ -1,0 +1,6 @@
+# Python 运行时产物
+__pycache__/
+*.pyc
+
+# 虚拟环境（本机可复现：pip install -r requirements.txt 即可重建）
+.venv/
