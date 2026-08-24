@@ -21,7 +21,6 @@ A* 要点（答辩高频考点，详见 docs/系统设计说明书.md）：
 
 import heapq
 import json
-import random
 
 import config
 
@@ -163,20 +162,6 @@ class GridMap:
         """按序号（0~3）取站台坐标——与 Modbus HR0~HR3 一一对应。"""
         _, x, y, _ = self.stations[index % len(self.stations)]
         return (x, y)
-
-    def random_slot_pair(self, rng):
-        """随机取两个不同的货位点，用于生成入库/出库/移库任务的起讫点。"""
-        a, b = rng.sample(self.slots, 2)
-        return a, b
-
-    def nearest_charge(self, pos, blocked=None):
-        """返回距 pos 最近的充电站坐标（A* 实际路程最近，而非直线最近）。"""
-        best, best_len = None, None
-        for _, x, y, _ in self.charges:
-            path = self.find_path(pos, (x, y), blocked=blocked)
-            if path is not None and (best_len is None or len(path) < best_len):
-                best, best_len = (x, y), len(path)
-        return best
 
     # ------------------------------------------------------------------
     # 邻格扩展（A* 的核心依赖）

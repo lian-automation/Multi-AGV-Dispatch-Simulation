@@ -25,6 +25,7 @@ Modbus/Flask 线程只通过引擎提供的线程安全入口间接读快照。
 from collections import defaultdict
 
 import config
+from simulator.agv import AGV   # 仅取状态常量；simulator 不反向依赖 traffic，无循环导入
 
 
 class TrafficController:
@@ -142,7 +143,7 @@ class TrafficController:
         graph = defaultdict(set)
         by_id = {a.id: a for a in agvs}
         for a in agvs:
-            if a.state == "fault" or a.next_cell is not None:
+            if a.state == AGV.FAULT or a.next_cell is not None:
                 continue  # 故障车不参与；已在移动中的车不存在"下一步被挡"
             if not a.path:
                 continue
@@ -160,7 +161,8 @@ class TrafficController:
         在等待图中找有向环；发现死锁则仲裁让路。
 
         仲裁策略（对应规格"低优先级车让路重规划，无解则原地等待计数上报"）：
-            1. 冷却期：同一个环在 2 秒内不重复仲裁（防止每拍空转刷计数）；
+            1. 冷却期：同一个环在 DEADLOCK_COOLDOWN_SECONDS 秒内不重复仲裁
+               （防止每拍空转刷计数）；
             2. 让路者优先级：剩余路径最长的车先让（离目标最远、绕行代价最小）；
                若反复失败则按轮换游标换一辆，避免永远盯死同一辆造成活锁；
             3. 渐进松弛重规划：
@@ -174,10 +176,11 @@ class TrafficController:
         if cycle is None:
             return  # 无环：系统健康
 
-        # ---- 冷却期检查：同一批成员的环 3 秒内只仲裁一次 ----
+        # ---- 冷却期检查：同一批成员的环在冷却期内只仲裁一次 ----
         key = frozenset(cycle)
         now = self.clock()
-        if now - self._cycle_cooldown.get(key, -99.0) < 3.0:
+        if now - self._cycle_cooldown.get(key, -99.0) \
+                < config.DEADLOCK_COOLDOWN_SECONDS:
             return
         self._cycle_cooldown[key] = now
 

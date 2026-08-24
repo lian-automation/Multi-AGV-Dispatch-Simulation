@@ -251,38 +251,14 @@ class AGV:
         self.waiting_seconds = 0.0
         self.consecutive_reroutes = 0
 
-    def set_path(self, path):
+    def _store_path(self, path, caller):
         """
-        替换剩余路径（调度层规划/重规划的统一入口）。
+        set_path / send_to 共用的起点契约校验与存储。
 
-        约定：path 必须以"当前格 或 已预约正在驶入的下一格"为起点，
-        这样已有的路权预约依然有效，不会出现两车同时进入一格。
-        若需要连已预约的格子一起放弃（让路场景），必须先由交通管制器
-        调用 traffic.release_reservations(agv) 回收预约，再置空 next_cell。
+        契约：path[0] 必须是"当前格"或"已预约正在驶入的下一格"，
+        保证已有路权预约依然有效；存储时去掉起点格，只留待走序列。
+        违反契约立即抛错，让调用方问题尽早暴露。
         """
-        first = self.next_cell if self.next_cell is not None else self.pos
-        if not path:
-            self.path = []
-            return
-        if path[0] == first or path[0] == self.pos:
-            self.path = list(path[1:])   # 去掉起点格，保留"待走序列"
-        else:
-            # 起点既不是当前格也不是预约格 => 调用方契约错误，尽早抛出便于排查
-            raise ValueError(
-                f"AGV{self.id}.set_path 起点契约错误：path[0]={path[0]}，"
-                f"当前格={self.pos}，预约格={self.next_cell}"
-            )
-
-    def send_to(self, state, path, charge_target=None):
-        """
-        通用"派车去某处"：回充场景使用。
-        与 set_path 的契约一致：path[0] 必须是当前格或已预约格。
-        """
-        self.state = state
-        self.charge_target = charge_target
-        self.next_cell = None
-        self.move_progress = 0.0
-        self.waiting_seconds = 0.0
         if not path:
             self.path = []
             return
@@ -291,8 +267,39 @@ class AGV:
             self.path = list(path[1:])
         else:
             raise ValueError(
-                f"AGV{self.id}.send_to 起点契约错误：path[0]={path[0]}，当前格={self.pos}"
+                f"AGV{self.id}.{caller} 起点契约错误：path[0]={path[0]}，"
+                f"当前格={self.pos}，预约格={self.next_cell}"
             )
+
+    def set_path(self, path):
+        """
+        替换剩余路径（调度层规划/重规划的统一入口）。
+
+        若需要连已预约的格子一起放弃（让路场景），必须先由交通管制器
+        调用 traffic.release_reservations(agv) 回收预约，再置空 next_cell。
+        """
+        self._store_path(path, "set_path")
+
+    def send_to(self, state, path, charge_target=None):
+        """
+        通用"派车去某处"：回充场景使用。
+
+        与 set_path 的起点契约一致。额外约束：调用时不得带着未完成的
+        进格预约（next_cell 必须为空）——本方法会清空 next_cell，
+        若此时仍有预约会泄漏到交通管制器的预约表里。
+        引擎侧已在派单前保证该前置条件（见 try_send_to_charge）。
+        """
+        if self.next_cell is not None:
+            raise ValueError(
+                f"AGV{self.id}.send_to 前置条件不满足：仍持有预约格 {self.next_cell}，"
+                f"请先由引擎回收预约"
+            )
+        self.state = state
+        self.charge_target = charge_target
+        self.next_cell = None
+        self.move_progress = 0.0
+        self.waiting_seconds = 0.0
+        self._store_path(path, "send_to")
 
     def reset_fault(self):
         """人工复位故障（看板按钮调用）。复位后回空闲，电量若低会自动申请回充。"""

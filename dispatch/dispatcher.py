@@ -568,6 +568,8 @@ class SimulationEngine:
         """低电回充：选最近的"空闲充电桩"，规划路线并出发。"""
         if agv.state != AGV.IDLE or not agv.need_charge():
             return
+        if agv.next_cell is not None:
+            return   # 正在挪车让位等动作中：等下一步走完再评估（send_to 前置条件）
         occupied = {c for c, a in self.traffic.cell_owner.items() if a != agv.id}
         free_chargers = [(x, y) for _, x, y, _ in self.map.charges
                          if (x, y) not in occupied]
