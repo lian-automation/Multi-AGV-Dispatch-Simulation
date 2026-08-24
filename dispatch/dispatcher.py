@@ -463,9 +463,8 @@ class SimulationEngine:
                 self.traffic.release_reservations(agv)
                 agv.next_cell = None
                 agv.set_path(new_path)
-                agv.replan_count += 1
                 agv.consecutive_reroutes += 1
-                self.traffic.reroute_total += 1
+                self.traffic.reroute_total += 1   # 全网唯一计数口径（修复双计）
                 self.events.add("reroute",
                                 f"AGV{agv.id} 前方被占，自动重规划"
                                 f"（改走 {len(new_path)-1} 步）")
@@ -655,7 +654,7 @@ class SimulationEngine:
             "deadlock_detected": ts["deadlock_detected"],
             "deadlock_resolved": ts["deadlock_resolved"],
             "unresolved_waits": ts["unresolved_waits"],
-            "replan_count": sum(a.replan_count for a in self.agvs) + ts["reroute_total"],
+            "replan_count": ts["reroute_total"],  # 全网唯一口径：拥堵绕行+死锁让路
             "low_battery_events": self.low_battery_events,
             "recharge_success": recharge_ok,
             "recharge_success_rate": round(recharge_ok / self.low_battery_events, 4)

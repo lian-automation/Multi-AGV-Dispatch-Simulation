@@ -74,7 +74,8 @@ class AGV:
         self.cells_loaded = 0           # 重载走过格数
         self.tasks_done = 0             # 完成任务数
         self.fault_count = 0            # 累计故障次数
-        self.replan_count = 0           # 累计被重规划次数
+        # 注：重规划次数统一由 traffic.reroute_total 全网计数（每事件恰好一次），
+        # 车辆侧不再重复维护，避免同一事件被统计两次
         self.recharge_count = 0         # 完成回充次数
 
     # ------------------------------------------------------------------
