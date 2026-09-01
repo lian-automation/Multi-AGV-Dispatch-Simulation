@@ -126,7 +126,9 @@ class ModbusBridge:
                 if self._get_reg(addr) == 1:
                     self._set_reg(addr, 0)              # 消费掉呼叫信号
                     if self.standalone:
-                        asyncio.get_event_loop().create_task(
+                        # 协程内应使用 get_running_loop()（P3-7）：
+                        # get_event_loop() 在无运行循环场景会触发弃用告警
+                        asyncio.get_running_loop().create_task(
                             self._auto_complete(k))
                         print(f"[Modbus] 站台{k+1} 呼叫 -> 5 秒后模拟完成")
                     else:
