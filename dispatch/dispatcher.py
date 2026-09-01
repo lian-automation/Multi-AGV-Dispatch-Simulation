@@ -16,9 +16,12 @@ dispatcher.py —— 任务分配 + A* 寻路 + 仿真引擎主循环
 线程模型：
     - 引擎在独立线程按 DT 节拍推进（realtime=True 时与真实时间同步）；
     - Flask / Modbus 线程只通过 snapshot() 与队列交互，
-      关键数据访问用 self.lock 保护，避免读到大半截的状态。
+      关键数据访问用 self.lock 保护，避免读到大半截的状态；
+    - Flask 的全部 POST 控制接口（暂停/复位/站台呼叫）统一持 engine.lock
+      进入，与引擎 tick 互斥——外部线程不绕锁直改仿真内部状态（P2-4）。
 """
 
+import itertools
 import threading
 import time
 from collections import deque
@@ -37,12 +40,14 @@ from traffic.controller import TrafficController
 class Task:
     """一次搬运任务：从 src 格取货送到 dst 格。id 全局自增。"""
 
-    _next_id = 1                      # 类级自增编号
+    # 自增编号用 itertools.count（next() 为 C 实现，GIL 下原子），
+    # 消除 "读-加-写" 三步竞态：看板直连呼叫与引擎线程并发建任务时
+    # 理论上可能撞号（P2-4）
+    _next_id = itertools.count(1)
     TYPE_NAMES = {"inbound": "入库", "outbound": "出库", "transfer": "移库"}
 
     def __init__(self, ttype, src, dst, born_at, station_index=None):
-        self.id = Task._next_id
-        Task._next_id += 1
+        self.id = next(Task._next_id)
         self.type = ttype             # inbound / outbound / transfer
         self.src = tuple(src)         # 取货点（格子）
         self.dst = tuple(dst)         # 卸货点（格子）
@@ -94,10 +99,13 @@ class EventLog:
     def __init__(self, capacity=None):
         capacity = capacity or config.EVENT_LOG_CAPACITY
         self._buf = deque(maxlen=capacity)
+        self._seq = 0                 # 全局自增序号：前端据此判重（P2-2）
         self.clock = lambda: 0.0     # 由引擎注入 sim_time 读取函数
 
     def add(self, kind, msg):
-        self._buf.append({"t": round(self.clock(), 1), "kind": kind, "msg": msg})
+        self._seq += 1
+        self._buf.append({"seq": self._seq, "t": round(self.clock(), 1),
+                          "kind": kind, "msg": msg})
 
     def tail(self, n=100):
         return list(self._buf)[-n:]
@@ -262,6 +270,14 @@ class Dispatcher:
             agv = self.strategy.select(task, idle, self.engine)
             if agv is None:
                 continue                                   # 该任务暂时无车可达，跳过等下拍
+            # ---- 分配守卫（一格一车不变式）----
+            # 接单车脚下的格子必须在占用表中登记为本人；任何分配（含退化
+            # 的原地接单）都不得让"车"与"占格记录"脱钩——否则该格沦为
+            # ghost cell，其他车可合法驶入（P1-1 的破口）。违反即 fail-fast。
+            if self.engine.traffic.cell_owner.get(agv.pos) != agv.id:
+                raise AssertionError(
+                    f"分配守卫违规：AGV{agv.id} 站于 {agv.pos}，但占用表记录为 "
+                    f"{self.engine.traffic.cell_owner.get(agv.pos)}，拒绝派单")
             # A* 规划去取货点的路径：只避其他车实际占用的格子（见 planning_blocked）
             start = agv.next_cell if agv.next_cell is not None else agv.pos
             path = self.engine.map.find_path(start, task.src,
@@ -276,6 +292,10 @@ class Dispatcher:
             self.engine.events.add(
                 "assign", f"任务#{task.id} 分配给 AGV{agv.id}"
                           f"（响应 {task.response_time:.2f}s，去程 {len(path)-1} 步）")
+            if not agv.path:
+                # 原地接单：取货点即脚下格，无伪移动，直接进入取货流程
+                # （占用预约表不变：脚下格本就登记为本人占用）
+                self.engine.on_pickup_arrived(agv)
 
     def pending_count(self):
         return sum(1 for t in self.tasks if t.assigned_at is None)
@@ -427,7 +447,12 @@ class SimulationEngine:
                     agv.fault_reset_at = None
                     self.events.add("fault", f"AGV{agv.id} 已复位（压测等效人工处理），恢复作业")
 
-        # 7) 指标采样（吞吐曲线 / 平均响应曲线）
+        # 7) 运行时不变式校验（P2-5）："一格一车/零对撞"从设计推断升级为
+        #    每拍实测——任一违规计入 invariant_violations 并 fail-fast
+        if config.INVARIANT_CHECK:
+            self.traffic.check_invariants(self.agvs)
+
+        # 8) 指标采样（吞吐曲线 / 平均响应曲线）
         self._sample_metrics(dt)
 
     # ------------------------------------------------------------------
@@ -472,13 +497,35 @@ class SimulationEngine:
 
     def _request_dodge(self, parked):
         """
-        请求一辆空闲停靠车"让位"：给它规划一条 ≤6 步的就近躲避路径。
-        车辆以空闲状态走完该路径（IDLE 也允许走 path），把路腾出来。
+        请求一辆空闲停靠车"让位"：由近及远（BFS 分层，半径 ≤6 步）搜索
+        可站之格，找到即规划挪车路径。车辆以空闲状态走完该路径
+        （IDLE 也允许走 path），把路腾出来。
+
+        实现说明（P2-1 修复）：旧实现的 `for radius in range(1, 7)` 循环体
+        不使用 radius，`neighbors()` 只返回紧邻格，半径搜索是死代码——
+        实际仅考虑 4 邻格，与"≤6 步就近躲避"的承诺不符。现改为真正的
+        BFS 分层：逐层外扩，每层内取 A* 路程最短者，直到 6 步半径。
         """
-        candidates = []
-        for radius in range(1, 7):                 # 由近及远找第一个可站之格
-            for nx, ny in self.map.neighbors(*parked.pos):
-                c = (nx, ny)
+        # ---- BFS 分层：rings[d] = 从停靠格出发恰好 d 步可达的格子 ----
+        rings = []
+        seen = {parked.pos}
+        frontier = [parked.pos]
+        for _ in range(config.DODGE_MAX_RADIUS):
+            nxt = []
+            for cx, cy in frontier:
+                for nx, ny in self.map.neighbors(cx, cy):
+                    c = (nx, ny)
+                    if c in seen:
+                        continue
+                    seen.add(c)
+                    nxt.append(c)
+            rings.append(nxt)
+            frontier = nxt
+
+        # ---- 由近及远：第一个存在可站格的层内，取 A* 路程最短者 ----
+        for ring in rings:
+            candidates = []
+            for c in ring:
                 if c in self.traffic.cell_owner or c in self.traffic.reservations:
                     continue
                 p = self.map.find_path(parked.pos, c,
@@ -486,14 +533,15 @@ class SimulationEngine:
                 if p is not None:
                     candidates.append((len(p), c, p))
             if candidates:
-                break
-        if not candidates:
-            return                                 # 无处可让：只能等死锁仲裁
-        _, _, path = min(candidates, key=lambda x: x[0])
-        parked.set_path(path)
-        self.events.add("reroute",
-                        f"AGV{parked.id} 收到让位指令，挪车 {len(path)-1} 步"
-                        f"为后车让行")
+                _, vacate, path = min(candidates, key=lambda x: (x[0], x[1]))
+                parked.set_path(path)
+                parked.goal_cell = vacate   # P2-6：同步行程终点，防止被死锁
+                                            # 仲裁选中后按过期目标（如充电桩）折返
+                self.events.add("reroute",
+                                f"AGV{parked.id} 收到让位指令，挪车 {len(path)-1} 步"
+                                f"为后车让行")
+                return
+        # 半径内无可站之格：只能等死锁仲裁
 
     # ------------------------------------------------------------------
     # AGV 回调接口（AGV.step 的 ctx 约定，见 agv.py）
@@ -563,6 +611,8 @@ class SimulationEngine:
             path = self.map.find_path(agv.pos, vacate)
             if path is not None:
                 agv.set_path(path)      # IDLE 状态也允许走完这段挪车路径
+                agv.goal_cell = vacate  # P2-6：同步行程终点，防止死锁仲裁
+                                        # 以过期的充电桩坐标为其重规划而折返占桩
 
     def try_send_to_charge(self, agv):
         """低电回充：选最近的"空闲充电桩"，规划路线并出发。"""
@@ -653,9 +703,11 @@ class SimulationEngine:
             "empty_rate": round(cells_empty / total_cells, 4) if total_cells else None,
             "cells_empty": cells_empty,
             "cells_loaded": cells_loaded,
-            "deadlock_detected": ts["deadlock_detected"],
-            "deadlock_resolved": ts["deadlock_resolved"],
+            "deadlock_detected": ts["deadlock_detected"],   # 物理死锁数（按环去重）
+            "deadlock_resolved": ts["deadlock_resolved"],   # 环消失数（消除）
+            "deadlock_arbitrations": ts["arbitration_total"],  # 仲裁触发次数
             "unresolved_waits": ts["unresolved_waits"],
+            "invariant_violations": ts["invariant_violations"],  # 占格冲突实测计数
             "replan_count": ts["reroute_total"],  # 全网唯一口径：拥堵绕行+死锁让路
             "low_battery_events": self.low_battery_events,
             "recharge_success": recharge_ok,

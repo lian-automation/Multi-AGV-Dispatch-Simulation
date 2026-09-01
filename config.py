@@ -76,8 +76,12 @@ FAULT_AUTO_RESET_SECONDS = 60 # 压测模式下故障车"人工复位"的等效�
 # =====================================================================
 RESERVATION_DEPTH = 3         # 预约深度：进格前除下一格外再"软预约"前方 N-1 格，
                               # 提前暴露行驶意图，减少路口对峙（一格一车约束不变）
+INVARIANT_CHECK = True        # 每拍校验"一格一车"不变式（两车同格/占格无主/
+                              # 幽灵占用预约记录），违规计入 invariant_violations
+                              # 并 fail-fast——"零对撞"由此成为被测量的结论（P2-5）
 DEADLOCK_CHECK_INTERVAL = 0.4 # 死锁检测周期（秒）：每隔多久在"等待图"里找一次环
 DEADLOCK_COOLDOWN_SECONDS = 3.0  # 同一死锁环的仲裁冷却期（秒）：期内不重复仲裁，防每拍空转
+DODGE_MAX_RADIUS = 6          # 空闲车让位搜索半径（BFS 步数）：由近及远找可站之格（P2-1）
 REROUTE_WAIT_LIMIT = 1.5      # 让路判定等待门限（秒）：被堵超过该时长才触发让路重规划，避免频繁抖动
 MAX_CONSECUTIVE_REROUTE = 3   # 同一车连续重规划上限：超过则原地等待并计数上报（防止活锁）
 

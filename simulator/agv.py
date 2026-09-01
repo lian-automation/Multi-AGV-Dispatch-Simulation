@@ -242,14 +242,27 @@ class AGV:
     # 任务接口（由调度器调用）
     # ------------------------------------------------------------------
     def assign_task(self, task, path_to_pickup):
-        """接单：登记任务、切换状态、装载去取货点的路径。"""
+        """
+        接单：登记任务、切换状态、装载去取货点的路径。
+
+        退化路径归一化（P1-1 修复，分配层守卫）：当取货点就是本车脚下格时，
+        A* 返回 [pos]，若照原样装载会对"自己的脚下格"发起伪移动——
+        走完后 commit_arrival 以 old==new 调用，曾把脚下格的占用记录删掉，
+        车还站在格上、占用表却为空（ghost cell，打破一格一车不变式）。
+        现将 [pos] 归一化为空路径：原地接单，不发起任何伪移动，
+        占格占用自始至终保持"人格合一"。
+        """
         self.task = task
         self.state = self.TO_PICKUP
-        self.path = list(path_to_pickup)
         self.next_cell = None
         self.move_progress = 0.0
         self.waiting_seconds = 0.0
         self.consecutive_reroutes = 0
+        if len(path_to_pickup) <= 1 and (not path_to_pickup
+                                         or tuple(path_to_pickup[0]) == self.pos):
+            self.path = []                      # 原地接单：空路径直达取货态
+        else:
+            self.path = list(path_to_pickup)
 
     def _store_path(self, path, caller):
         """
