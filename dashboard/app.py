@@ -39,34 +39,46 @@ def create_app(engine):
 
     @app.route("/api/pause", methods=["POST"])
     def api_pause():
-        engine.paused = not engine.paused
-        state = "暂停" if engine.paused else "继续"
-        engine.events.add("info", f"仿真已{state}（看板操作）")
-        return jsonify({"paused": engine.paused})
+        # 线程纪律（P2-4）：与引擎 tick 互斥，外部线程不绕锁直改状态
+        with engine.lock:
+            engine.paused = not engine.paused
+            state = "暂停" if engine.paused else "继续"
+            engine.events.add("info", f"仿真已{state}（看板操作）")
+            paused = engine.paused
+        return jsonify({"paused": paused})
 
     @app.route("/api/agv/<int:agv_id>/reset", methods=["POST"])
     def api_reset(agv_id):
-        for agv in engine.agvs:
-            if agv.id == agv_id:
-                if agv.reset_fault():
-                    agv.fault_reset_at = None
-                    engine.events.add("fault", f"AGV{agv.id} 已人工复位（看板按钮），恢复待命")
-                    return jsonify({"ok": True})
-                return jsonify({"ok": False, "msg": "该车不在故障态"}), 400
-        return jsonify({"ok": False, "msg": "车辆不存在"}), 404
+        # 线程纪律（P2-4）：复位会改 agv 的 state/path/task/next_cell，
+        # 必须持 engine.lock 与 tick 互斥
+        with engine.lock:
+            for agv in engine.agvs:
+                if agv.id == agv_id:
+                    if agv.reset_fault():
+                        agv.fault_reset_at = None
+                        engine.events.add("fault", f"AGV{agv.id} 已人工复位（看板按钮），恢复待命")
+                        return jsonify({"ok": True})
+                    return jsonify({"ok": False, "msg": "该车不在故障态"}), 400
+            return jsonify({"ok": False, "msg": "车辆不存在"}), 404
 
     @app.route("/api/call/<int:k>", methods=["POST"])
     def api_call(k):
         """模拟站台呼叫按钮：优先走 Modbus 寄存器链路（更贴近真实）。"""
         if not 0 <= k <= 3:
             return jsonify({"ok": False, "msg": "站台序号 0~3"}), 400
-        bridge = engine.modbus
-        if bridge is not None:
-            addr = bridge.trigger_call(k)
-            return jsonify({"ok": True, "via": f"Modbus HR{addr}=1"})
-        # 未启用 Modbus 时退化为直接生成任务（保证功能不缺失）
-        engine.dispatcher.create_task("outbound", now=engine.sim_time, station_index=k)
-        return jsonify({"ok": True, "via": "直连调度器（未启用Modbus）"})
+        # 线程纪律（P2-4）：任务创建（含直连退化路径的 Task id 分配与
+        # dispatcher.tasks.append）统一持 engine.lock，与 assign_pending 互斥
+        with engine.lock:
+            bridge = engine.modbus
+            if bridge is not None:
+                addr = bridge.trigger_call(k)
+                via = f"Modbus HR{addr}=1"
+            else:
+                # 未启用 Modbus 时退化为直接生成任务（保证功能不缺失）
+                engine.dispatcher.create_task("outbound", now=engine.sim_time,
+                                              station_index=k)
+                via = "直连调度器（未启用Modbus）"
+        return jsonify({"ok": True, "via": via})
 
     return app
 

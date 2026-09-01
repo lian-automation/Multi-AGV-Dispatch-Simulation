@@ -210,12 +210,16 @@ function updateTaskTable() {
 }
 
 /* ================= 事件日志 ================= */
-let lastLogLen = -1;
+let lastLogSeq = -1;
 function updateLog() {
   if (!latest) return;
-  if (latest.events.length === lastLogLen) return;   // 无新事件不重绘
-  lastLogLen = latest.events.length;
-  document.getElementById("logBox").innerHTML = latest.events.slice().reverse()
+  const evs = latest.events;
+  // 以末条事件的全局自增 seq 判重（P2-2：缓冲区满后 tail 长度恒定，
+  // 旧实现按"长度不变"判重会导致日志永久冻结）
+  const topSeq = evs.length ? evs[evs.length - 1].seq : 0;
+  if (topSeq === lastLogSeq) return;
+  lastLogSeq = topSeq;
+  document.getElementById("logBox").innerHTML = evs.slice().reverse()
     .map(e => `<p><span class="tag" style="background:${
         KIND_COLOR[e.kind] || "#334155"}33;color:${KIND_COLOR[e.kind] || "#ccc"
         }">${KIND_LABEL[e.kind] || e.kind}</span>
