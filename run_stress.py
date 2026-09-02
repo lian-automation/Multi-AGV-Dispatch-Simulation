@@ -9,7 +9,8 @@ run_stress.py —— 压力测试脚本（核心产出）
     1. 总吞吐量（完成任务数 / 分钟）
     2. 平均任务响应时间（到达 -> 分配）
     3. 空载行驶率（空载格数 / 总行驶格数）
-    4. 物理死锁数（按环去重）/ 消除数 / 仲裁触发次数 / 让路无解环数
+    4. 物理死锁数（按环去重）/ 消除数 / 仲裁触发次数（与发生/消除分列）/
+       仲裁升级侧避改道数 / 不可解环数（unresolved，按环首次判定计）
     5. 重规划次数（拥堵绕行 + 让路）与 占格冲突（每拍不变式断言实测）
     6. 低电回充成功率（充满次数 / 回充触发次数）
 
@@ -117,8 +118,9 @@ def build_report(rows, lam, task_total, seed):
     row("重载行驶格数", "cells_loaded")
     row("**死锁发生次数（按环去重的物理死锁数）**", "deadlock_detected")
     row("**死锁消除次数（环消失）**", "deadlock_resolved")
-    row("仲裁触发次数", "deadlock_arbitrations")
-    row("让路无解原地等待的物理死锁环数", "unresolved_waits")
+    row("仲裁触发次数（冷却期后每次实际执行，同一环可重复）", "deadlock_arbitrations")
+    row("仲裁升级侧避改道次数（目标被堵假成功根治，复审06 N1）", "dodge_detours")
+    row("让路无解/不可解的物理死锁环数（按环首次判定计）", "unresolved_waits")
     row("**让路重规划次数**", "replan_count")
     row("**占格冲突/不变式违规（每拍实测）**", "invariant_violations")
     row("低电回充触发次数", "low_battery_events")
@@ -167,15 +169,23 @@ def build_report(rows, lam, task_total, seed):
     lines.append(f"3. **空载行驶率**：{emp_txt}。{why}。")
 
     # ---- 4. 死锁与重规划：按环去重的物理死锁口径 + 被测量的占格冲突 ----
+    # 口径分列（复审06 N2）：物理死锁数（按环去重的"发生"）、环消失数（"消除"）、
+    # 仲裁触发次数（冷却期门控后每次实际执行，同一环可重复触发）三者互不相同，
+    # 不得混用——旧口径曾把 2176 次仲裁误报为 2176 起死锁。
     dl = [r["deadlock_detected"] for r in rows]
     rs = [r["deadlock_resolved"] for r in rows]
     arb = [r["deadlock_arbitrations"] for r in rows]
+    esc = [r.get("dodge_detours", 0) for r in rows]
     unres = sum(r["unresolved_waits"] for r in rows)
     dl_txt = " / ".join(str(v) for v in dl)
     rs_txt = " / ".join(str(v) for v in rs)
     arb_txt = " / ".join(str(v) for v in arb)
-    tail = (f"{unres} 个环曾让路无解而原地等待，待阻挡格局变化后自行恢复"
-            if unres else "全部环经让路重规划或自行消解，无原地等待残留")
+    esc_txt = " / ".join(str(v) for v in esc)
+    # "全部环已消解"的结论只有在 unresolved==0 时才允许输出（复审06 N2 门控）
+    tail = (f"{unres} 个环判定为不可解环（让路无解或目标被堵且无侧避格），"
+            "按原地等待处理并已计入上报"
+            if unres else
+            "unresolved=0：全部环经让路重规划、侧避改道或自行消解，无原地等待残留")
     inv = sum(r["invariant_violations"] for r in rows)
     if inv == 0:
         inv_txt = ("占格冲突计数为 0——该值来自引擎每拍执行的\"一格一车\"不变式"
@@ -185,8 +195,9 @@ def build_report(rows, lam, task_total, seed):
         inv_txt = (f"不变式断言实测违规 {inv} 次——占格冲突并非 0，"
                    "该结果不可用于宣称零对撞，需排查根因。")
     lines.append(f"4. **死锁与重规划**：物理死锁（按环去重）{dl_txt} 起、消除 "
-                 f"{rs_txt} 起；仲裁触发 {arb_txt} 次（同一环冷却期后的重复仲裁"
-                 f"不再计入\"发生\"）；{tail}。{inv_txt}")
+                 f"{rs_txt} 起；仲裁触发 {arb_txt} 次（口径=同一环冷却期后的重复"
+                 f"仲裁照常计数，与\"发生/消除\"分列，不得混用）；其中让路者目标"
+                 f"被堵、升级为\"先侧避再回原目标\"改道 {esc_txt} 次；{tail}。{inv_txt}")
 
     # ---- 5. 低电回充：只陈述有数据支撑的事实 ----
     rc = [f"{r['recharge_success_rate']:.0%}"

@@ -14,9 +14,11 @@ controller.py —— 交通管制器（本项目灵魂模块）
          "申请者 -> 阻挡者"，全图构成一张有向"等待图"；
        - 找圈：周期性对等待图做 DFS 找有向环。存在环 <=> 存在一组车互相等待，
          谁也不肯动 => 这就是死锁（对应死锁四必要条件中的"循环等待"）;
-       - 解除：选中环内"剩余路径最长的低优先级车"作为让路者，
-         回收其全部预约后按"避开其他车占/预约格"重新 A*；
-         若重规划无解，则原地等待并计数上报（unresolved_waits）。
+       - 解除：优先选"目标格未被堵"的环内车作为让路者，回收其全部预约后
+         按"避开其他车占/预约格"重新 A*，且新路径首格必须当前可通行
+         （有效性判据，防终点豁免造成的"假成功"重规划空转——复审06 N1）；
+         目标恰被堵时升级为"先侧避再回原目标"的改道；侧避也无解才判
+         "不可解环"，原地等待并按环首次判定计数上报（unresolved_waits）。
 
     C. 不变式校验 —— 让"一格一车/零对撞"成为被测量的结论
        check_invariants() 每拍校验：任意两车 pos 互异、每车脚下格必有
@@ -60,6 +62,8 @@ class TrafficController:
         self.arbitration_total = 0           # 仲裁触发次数（冷却门控后实际执行）
         self.unresolved_waits = 0            # 发生过"让路无解原地等待"的物理死锁数
         self.reroute_total = 0               # 让路重规划执行总次数
+        self.dodge_detours = 0               # 仲裁升级：让路者目标被堵而"先侧避再回
+                                             # 原目标"的改道次数（复审06 N1 根治观测量）
 
         # 检测节奏与仲裁状态
         self._check_timer = 0.0
@@ -197,12 +201,18 @@ class TrafficController:
             1. 冷却期：同一个环在 DEADLOCK_COOLDOWN_SECONDS 秒内不重复仲裁
                （防止每拍空转刷计数）；
             2. 让路者优先级：剩余路径最长的车先让（离目标最远、绕行代价最小）；
+               且优先选"目标格未被堵"的候选——目标恰为被堵格的车重规划会因
+               A* 终点豁免而"假成功"，指派它让路无法破环（复审06 N1 根治）；
                若反复失败则按轮换游标换一辆，避免永远盯死同一辆造成活锁；
             3. 渐进松弛重规划：
                第1次 避开其他车的占用格+预约格（严格，不打扰任何人）；
                第2次 只避占用格（允许借道别人"已预约但尚未进入"的格子——
                      真正进格时仍要过 request_cell 路权审查，安全不受影响）；
-               都失败才判"无解"，原地等待并计数上报。
+            4. 有效性判据与升级（复审06 N1 根治）：重规划"成功"必须以
+               "装载后下一步即能获得路权"为准——新路径首格仍被其他车占/预约
+               （终点豁免的典型假成功）不得直接装载，升级为"先侧避空格、
+               再回原目标"的改道；侧避也无解才判"不可解环"，原地等待并
+               按 ring 首次判定计入 unresolved_waits 上报。
         """
         graph, by_id = self._build_wait_graph(agvs)
         now = self.clock()
@@ -241,9 +251,14 @@ class TrafficController:
         self.arbitration_total += 1
 
         # ---- 选让路者：按"剩余路径最长"优先排序 + 轮换游标防活锁 ----
+        # 复审06 N1 根治：优先在"目标格当前未被其他车占/预约"的候选中轮换
+        # （目标被堵者的重规划会因终点豁免而假成功，指派它无法破环）；
+        # 全员目标被堵（对头互等）才退回全集轮换，由下面的升级改道破环。
         ordered = sorted(cycle, key=lambda i: len(by_id[i].path), reverse=True)
+        pool = [i for i in ordered
+                if not self._goal_blocked_by_others(by_id[i])] or ordered
         self._victim_cursor += 1
-        victim = ordered[(self._victim_cursor - 1) % len(ordered)]
+        victim = pool[(self._victim_cursor - 1) % len(pool)]
         victim_agv = by_id[victim]
         goal = getattr(victim_agv, "goal_cell", victim_agv.pos)
 
@@ -266,7 +281,8 @@ class TrafficController:
             if new_path is not None:
                 break
 
-        if new_path is not None and len(new_path) > 1:
+        if new_path is not None and len(new_path) > 1 \
+                and self.first_step_grantable(victim_agv, new_path):
             victim_agv.set_path(new_path)
             self.reroute_total += 1
             # 注：deadlock_resolved 不在此处计数——环真正从活跃集合消失时
@@ -275,16 +291,104 @@ class TrafficController:
             self.events.add("reroute",
                             f"死锁仲裁：AGV{victim} 让路重规划"
                             f"（新路径 {len(new_path)-1} 步），等待环待消解")
+        elif new_path is not None and len(new_path) > 1:
+            # ---- 假成功重规划的升级处理（复审06 N1 根治）----
+            # 新路径首格当前仍被其他车占/预约——典型：goal 恰为互等方的脚下格，
+            # A* 终点豁免使重规划恒返回同一条直达路径；直接装载则下一拍仍原地
+            # 被拒、等待关系不变，仲裁按冷却期无限自旋而环永不消。
+            # 升级：为让路者规划"先侧避空格、再回原目标"的改道（原目标仍是
+            # 终点，到点取/放货语义不变）；让路者一挪，互等格腾出，环即消散。
+            detour = self._plan_dodge_detour(victim_agv, goal, strict_blocked)
+            if detour is not None:
+                victim_agv.set_path(detour)
+                self.reroute_total += 1
+                self.dodge_detours += 1
+                self.events.add("reroute",
+                                f"死锁仲裁：AGV{victim} 目标格{goal}被互等方占用，"
+                                f"升级为先侧避再回原目标（共 {len(detour)-1} 步）")
+            else:
+                self._mark_unresolved(
+                    cycle, key, victim, "目标被堵且半径内无侧避格")
         else:
-            # 两档都无解（如狭窄巷道两侧被堵死）：原地等待并上报。
-            # 每个物理死锁环至多计 1 次，不再随冷却期反复累加（P2-3 去重）。
-            entry = self._active_cycles.get(key)
-            if entry is not None and not entry["unresolved"]:
-                entry["unresolved"] = True
-                self.unresolved_waits += 1
-                self.events.add("deadlock",
-                                f"AGV{victim} 让路重规划无解，原地等待"
-                                f"（待道路腾空后自动恢复）")
+            # 两档都无解（如狭窄巷道两侧被堵死，或 goal 即脚下的退化无目标
+            # 情形）：原地等待并上报。每个物理死锁环至多计 1 次（P2-3 去重）。
+            self._mark_unresolved(cycle, key, victim, "让路重规划两档均无解")
+
+    # ------------------------------------------------------------------
+    # 仲裁辅助（复审06 N1 根治引入）
+    # ------------------------------------------------------------------
+    def _goal_blocked_by_others(self, agv):
+        """候选让路者的当前目标格是否恰好被其他车占用/预约（被堵格/环内格）。"""
+        goal = getattr(agv, "goal_cell", agv.pos)
+        owner = self.cell_owner.get(goal)
+        booker = self.reservations.get(goal)
+        return (owner is not None and owner != agv.id) \
+            or (booker is not None and booker != agv.id)
+
+    def first_step_grantable(self, agv, path):
+        """
+        重规划有效性判据（复审06 N1）：
+        path 为含起点的完整路径（find_path 口径），检查装载后首个待走格
+        （path[1]）当前能否获得路权（未被其他车占用/预约）。
+        False => 装载后下一拍仍原地被拒、等待关系不变，属"假成功"重规划，
+        不得计入有效让路（自旋根源）。
+        """
+        if len(path) <= 1:
+            return False
+        first = path[1]
+        owner = self.cell_owner.get(first)
+        booker = self.reservations.get(first)
+        return (owner is None or owner == agv.id) \
+            and (booker is None or booker == agv.id)
+
+    def _plan_dodge_detour(self, agv, goal, blocked):
+        """
+        为"目标格恰被互等方占用"的让路者规划侧避改道：
+        先退到半径内一个当前完全空闲的侧避格（BFS 由近及远，镜像
+        dispatcher._request_dodge 的分层搜索），再从侧避格规划回原目标，
+        两段拼接、原目标仍为终点——车辆走完全程才触发到点结算，
+        取/放货任务语义不被破坏。
+        :return: 完整路径（含起点与原目标终点）；半径内无侧避格返回 None
+        """
+        occupied = set(self.cell_owner.keys()) | set(self.reservations.keys())
+        seen = {agv.pos}
+        frontier = [agv.pos]
+        for _ in range(config.DODGE_MAX_RADIUS):
+            nxt = []
+            for cx, cy in frontier:
+                for nb in self.map.neighbors(cx, cy):
+                    if nb not in seen:
+                        seen.add(nb)
+                        nxt.append(nb)
+            # 本层内取 A* 路程最短的空闲侧避格，逐个尝试接"回原目标"段
+            candidates = []
+            for c in sorted(nxt):                      # 排序保证结果确定性
+                if c in occupied:
+                    continue
+                p1 = self.map.find_path(agv.pos, c, blocked=blocked)
+                if p1 is not None:
+                    candidates.append((len(p1), c, p1))
+            for _, c, p1 in sorted(candidates, key=lambda x: (x[0], x[1])):
+                p2 = self.map.find_path(c, goal, blocked=blocked)
+                if p2 is not None:
+                    return p1 + p2[1:]
+            frontier = nxt
+        return None
+
+    def _mark_unresolved(self, cycle, key, victim, reason):
+        """
+        不可解环上报：按环首次判定计 1 次 unresolved_waits（P2-3 去重口径），
+        并发出显著告警事件（复审06 N1/N2：自旋/无解不得静默，
+        杜绝"全部环已消解"的失真结论）。
+        """
+        entry = self._active_cycles.get(key)
+        if entry is not None and not entry["unresolved"]:
+            entry["unresolved"] = True
+            self.unresolved_waits += 1
+            names = "->".join(f"AGV{i}" for i in sorted(cycle))
+            self.events.add("deadlock",
+                            f"⚠ 不可解环[{names}]：AGV{victim} {reason}，"
+                            f"原地等待外部格局变化（已计入 unresolved 上报）")
 
     @staticmethod
     def _find_cycle(graph):
@@ -374,6 +478,7 @@ class TrafficController:
             "deadlock_resolved": self.deadlock_resolved,   # 环消失数（消除）
             "arbitration_total": self.arbitration_total,   # 仲裁触发次数
             "reroute_total": self.reroute_total,
+            "dodge_detours": self.dodge_detours,   # 仲裁升级侧避改道次数（N1）
             "unresolved_waits": self.unresolved_waits,
             "invariant_violations": self.invariant_violations,
         }

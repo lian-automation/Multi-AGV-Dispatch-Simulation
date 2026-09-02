@@ -484,7 +484,8 @@ class SimulationEngine:
             if new_path is None:
                 new_path = self.map.find_path(
                     agv.pos, agv.goal_cell, blocked=self.planning_blocked(agv))
-            if new_path is not None and len(new_path) - 1 > 0:
+            if new_path is not None and len(new_path) - 1 > 0 \
+                    and self.traffic.first_step_grantable(agv, new_path):
                 self.traffic.release_reservations(agv)
                 agv.next_cell = None
                 agv.set_path(new_path)
@@ -493,6 +494,12 @@ class SimulationEngine:
                 self.events.add("reroute",
                                 f"AGV{agv.id} 前方被占，自动重规划"
                                 f"（改走 {len(new_path)-1} 步）")
+            elif new_path is not None and len(new_path) - 1 > 0:
+                # 假成功路径不装载（复审06 N1 同源修复）：新路径首格仍被其他车
+                # 占/预约（典型：终点豁免使 goal 被堵时恒返回同一条直达路径），
+                # 装载后下一拍仍原地被拒，纯属空转——计入连续重规划上限，
+                # 交由死锁仲裁按"目标被堵"分支升级处理。
+                agv.consecutive_reroutes += 1
             agv.waiting_seconds = 0.0    # 无论成败都清零计时，进入下一轮观察窗
 
     def _request_dodge(self, parked):
@@ -706,6 +713,7 @@ class SimulationEngine:
             "deadlock_detected": ts["deadlock_detected"],   # 物理死锁数（按环去重）
             "deadlock_resolved": ts["deadlock_resolved"],   # 环消失数（消除）
             "deadlock_arbitrations": ts["arbitration_total"],  # 仲裁触发次数
+            "dodge_detours": ts["dodge_detours"],  # 仲裁升级侧避改道次数（N1）
             "unresolved_waits": ts["unresolved_waits"],
             "invariant_violations": ts["invariant_violations"],  # 占格冲突实测计数
             "replan_count": ts["reroute_total"],  # 全网唯一口径：拥堵绕行+死锁让路
