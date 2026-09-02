@@ -12,7 +12,11 @@ test_regression.py —— 最小回归测试（审查报告06 · 路线图第6�
        仲裁触发按冷却期照常累加，环消失才计"消除"；
     5. 复审06 N1 回归：让路者 goal 恰为被堵格（互等方脚下格）时，
        仲裁不得凭 A* 终点豁免的"假成功"路径无限自旋——必须有限时间内
-       破环（升级侧避改道）或如实计入 unresolved 上报。
+       破环（升级侧避改道）或如实计入 unresolved 上报；
+    6. 复审06 N3 回归：不变式违规的可观测化处置——压测/批处理（strict）
+       违规 fail-fast 中止、报告如实写入违规详情、进程非零退出码；
+       realtime 看板（observable）违规不杀引擎线程：violation 事件入流、
+       引擎安全停机（不再派单、车辆制动停车）、快照可见告警状态。
 
 运行方式（无第三方测试依赖）：
     python -m unittest discover -s tests -v      # 在项目根目录执行
@@ -21,6 +25,8 @@ test_regression.py —— 最小回归测试（审查报告06 · 路线图第6�
 
 import os
 import sys
+import threading
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -247,6 +253,162 @@ class DodgeGoalBlockedSpin(unittest.TestCase):
                             "判定破环成功却全程零位移，不合常理")
         # 安全底线：整个过程中"一格一车"不变式始终成立
         self.assertEqual(eng.traffic.invariant_violations, 0)
+
+
+class InvariantViolationObservability(unittest.TestCase):
+    """复审06 N3 回归：不变式违规的可观测化处置。
+
+    旧行为的两处问题：① realtime 模式违规抛 AssertionError 直接杀死引擎
+    线程——看板静默冻结（无日志无提示）；② 压测报告 inv>0 分支因违规即
+    中止而不可达（死代码）。修复后两模式口径：
+        strict（压测/批处理，auto 默认）：违规即抛（fail-fast 强度不变），
+        场景中止、报告如实写入违规详情、进程非零退出码；
+        observable（realtime 看板，auto 默认）：违规不杀线程——violation
+        事件入流、详情入 metrics/快照、引擎安全停机（不再派单、车辆制动
+        停车）、看板显示 INVARIANT VIOLATION 横幅。
+    """
+
+    def _strict_engine(self, fleet=2):
+        # stress=True 且非 realtime => auto 解析为 strict（压测口径）
+        eng = SimulationEngine(fleet_size=fleet, lam=1e-9, realtime=False,
+                               seed=20240601, stress=True)
+        self.assertEqual(eng.invariant_mode, "strict")
+        return eng
+
+    def _observable_engine(self, fleet=2):
+        # realtime=True 且非压测 => auto 解析为 observable（看板口径）
+        eng = SimulationEngine(fleet_size=fleet, lam=1e-9, realtime=True,
+                               seed=20240601, stress=False)
+        self.assertEqual(eng.invariant_mode, "observable")
+        return eng
+
+    @staticmethod
+    def _inject_collision(eng):
+        """注入"两车同格"违规：把 AGV2 传送到 AGV1 脚下格。"""
+        eng.agvs[1].pos = eng.agvs[0].pos
+
+    # ---------------- strict：压测/批处理口径 ----------------
+    def test_strict_mode_fail_fast_on_violation(self):
+        """压测引擎 tick：违规即抛 AssertionError（fail-fast 保持），详情登记。"""
+        eng = self._strict_engine()
+        self._inject_collision(eng)
+        before = eng.traffic.invariant_violations
+        with self.assertRaises(AssertionError):
+            eng.tick(config.DT)
+        self.assertEqual(eng.traffic.invariant_violations, before + 1)
+        d = eng.traffic.violation_details[0]
+        self.assertEqual(d["kind"], "两车同格")
+        self.assertEqual(sorted(d["agvs"]), [1, 2])
+        self.assertEqual(d["cell"], list(eng.agvs[0].pos))
+        self.assertTrue(d["message"].startswith("不变式违规[两车同格]"))
+
+    def test_stress_scenario_reports_violation_and_nonzero_exit(self):
+        """压测链路：run_scenario 捕获违规 → 报告行带详情（inv>0 分支接通）
+        → build_report 含违规事实 → finalize 返回非零退出码且报告落盘。"""
+        import run_stress
+        eng = self._strict_engine()
+        self._inject_collision(eng)
+        row = run_stress.run_scenario(2, 5, 0.6, 20240601, engine=eng)
+        self.assertTrue(row["aborted_on_invariant"])
+        self.assertIn("两车同格", row["invariant_detail"])
+        self.assertGreaterEqual(row["invariant_violations"], 1)
+        report = run_stress.build_report([row], 0.6, 5, 20240601)
+        self.assertIn("实测违规", report)
+        self.assertIn("两车同格", report)
+        self.assertIn("非零退出码", report)
+        with tempfile.TemporaryDirectory() as td:   # 不触碰 docs/压测报告.md
+            path = os.path.join(td, "report.md")
+            code = run_stress.finalize([row], 0.6, 5, 20240601, report_path=path)
+            self.assertEqual(code, 1)
+            with open(path, encoding="utf-8") as fp:
+                self.assertIn("两车同格", fp.read())
+            # 正常场景（无违规中止标记）退出码必须仍为 0
+            clean = dict(row)
+            clean.pop("aborted_on_invariant", None)
+            clean.pop("invariant_detail", None)
+            self.assertEqual(
+                run_stress.finalize([clean], 0.6, 5, 20240601,
+                                    report_path=os.path.join(td, "ok.md")),
+                0)
+
+    # ---------------- observable：realtime 看板口径 ----------------
+    def test_observable_mode_safe_stop_visible_and_audible(self):
+        """看板引擎 tick：违规不抛不杀线程——violation 事件入流、安全停机、
+        快照可见、不再派发新任务、车辆制动停车、无事件刷屏。"""
+        eng = self._observable_engine()
+        self._inject_collision(eng)
+        eng.tick(config.DT)                     # 不得抛异常（线程不被杀死）
+        self.assertTrue(eng.halted)
+        self.assertEqual(eng.halt_reason, "INVARIANT_VIOLATION")
+        kinds = [e["kind"] for e in eng.events.tail(100)]
+        self.assertIn("violation", kinds)       # 事件流有 violation 事件（无静默）
+        self.assertGreaterEqual(eng.traffic.invariant_violations, 1)
+        self.assertTrue(eng.metrics()["invariant_violation_details"])
+        # 快照可见告警状态（看板横幅数据源）
+        snap = eng.snapshot()
+        self.assertTrue(snap["halted"])
+        self.assertEqual(snap["halt_reason"], "INVARIANT_VIOLATION")
+        self.assertTrue(snap["invariant_details"])
+        # 安全停机：继续推进不抛错，车辆位置/路径冻结、不再派发新任务
+        task = eng.dispatcher.create_task("outbound", eng.sim_time)
+        frozen = {a.id: a.pos for a in eng.agvs}
+        for _ in range(25):                     # 5 仿真秒
+            eng.tick(config.DT)
+        self.assertTrue(all(a.pos == frozen[a.id] and a.path == []
+                            and a.next_cell is None for a in eng.agvs))
+        self.assertIsNone(task.assigned_at)     # 停机后不派新单
+        # 无事件刷屏：停机态不再重复计数/记录
+        count = eng.traffic.invariant_violations
+        for _ in range(10):
+            eng.tick(config.DT)
+        self.assertEqual(eng.traffic.invariant_violations, count)
+
+    def test_realtime_run_survives_unexpected_exception(self):
+        """realtime 主循环兜底（N3 同类"无提示停机"的根治）：未预期异常
+        不杀引擎线程——登记 fault 事件并进入安全停机，看板保持可见。"""
+        eng = self._observable_engine()
+        calls = {"n": 0}
+        orig_tick = eng.tick
+
+        def flaky(dt):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("注入的引擎内部异常")
+            orig_tick(dt)
+
+        eng.tick = flaky
+        t = threading.Thread(target=eng.run, daemon=True, name="SimEngineThread")
+        t.start()
+        t.join(5.0)
+        self.assertTrue(t.is_alive(), "引擎线程被未预期异常杀死（静默冻结回归）")
+        self.assertTrue(eng.halted)
+        self.assertEqual(eng.halt_reason, "ENGINE_ERROR")
+        self.assertTrue(any(e["kind"] == "fault" for e in eng.events.tail(50)))
+        eng.stop()
+        t.join(5.0)
+
+    # ---------------- 模式解析：auto / 显式 / 非法 ----------------
+    def test_mode_resolution_auto_explicit_invalid(self):
+        """auto 按压测/realtime 判定（默认语义保持）；显式配置可覆盖；
+        非法配置构造引擎时即报错（fail-fast）。"""
+        self.assertEqual(make_engine(2).invariant_mode, "strict")   # 压测=>strict
+        self.assertEqual(self._observable_engine().invariant_mode,
+                         "observable")                              # 看板=>observable
+        old = config.INVARIANT_VIOLATION_MODE
+        try:
+            config.INVARIANT_VIOLATION_MODE = "observable"          # 显式覆盖压测引擎
+            eng = SimulationEngine(fleet_size=2, lam=1e-9, realtime=False,
+                                   seed=20240601, stress=True)
+            self.assertEqual(eng.invariant_mode, "observable")
+            self._inject_collision(eng)
+            eng.tick(config.DT)                     # 显式 observable 不抛错
+            self.assertTrue(eng.halted)
+            config.INVARIANT_VIOLATION_MODE = "bogus"
+            with self.assertRaises(ValueError):
+                SimulationEngine(fleet_size=1, lam=1e-9, realtime=False,
+                                 stress=True)
+        finally:
+            config.INVARIANT_VIOLATION_MODE = old
 
 
 if __name__ == "__main__":

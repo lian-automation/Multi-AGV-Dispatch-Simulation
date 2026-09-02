@@ -32,30 +32,45 @@ from dispatch.dispatcher import SimulationEngine
 from map.grid_map import load_map
 
 
-def run_scenario(cars, task_total, lam, seed):
+def run_scenario(cars, task_total, lam, seed, engine=None):
     """
     跑一个压测场景直到完成 task_total 个任务或超时。
+    :param engine: 可注入的预建引擎（回归测试用于注入违规场景）；
+                   None 时按参数新建。
     :return: (metrics 字典, 墙钟耗时秒)
     """
     print(f"\n>>> 场景：{cars} 台车 × {task_total} 任务（λ={lam}/s）开始…")
-    engine = SimulationEngine(fleet_size=cars, lam=lam, realtime=False,
-                              seed=seed, stress=True, max_tasks=task_total)
+    if engine is None:
+        engine = SimulationEngine(fleet_size=cars, lam=lam, realtime=False,
+                                  seed=seed, stress=True, max_tasks=task_total)
     wall_start = time.perf_counter()
-    tick = 0
-    while True:
-        engine.tick(config.DT)
-        tick += 1
-        if tick % 25 == 0:                      # 每 25 拍（5 仿真秒）看一眼进度
-            done = sum(1 for t in engine.dispatcher.tasks
-                       if t.finished_at is not None)
-            if done >= task_total:
-                break
-            if engine.sim_time > config.STRESS_SCENARIO_TIMEOUT:
-                print(f"    ⚠ 达到场景超时上限 {config.STRESS_SCENARIO_TIMEOUT}s，"
-                      f"以当前进度收尾（完成 {done} 个）")
-                break
+    aborted_detail = None
+    try:
+        tick = 0
+        while True:
+            engine.tick(config.DT)
+            tick += 1
+            if tick % 25 == 0:                      # 每 25 拍（5 仿真秒）看一眼进度
+                done = sum(1 for t in engine.dispatcher.tasks
+                           if t.finished_at is not None)
+                if done >= task_total:
+                    break
+                if engine.sim_time > config.STRESS_SCENARIO_TIMEOUT:
+                    print(f"    ⚠ 达到场景超时上限 {config.STRESS_SCENARIO_TIMEOUT}s，"
+                          f"以当前进度收尾（完成 {done} 个）")
+                    break
+    except AssertionError as exc:
+        # strict fail-fast（复审06 N3）：不变式违规即中止本场景——异常仍由
+        # 引擎抛出（fail-fast 强度不变），脚本在此捕获以把违规详情如实带回
+        # 报告（inv>0 报告分支由此接通，不再是不可达死代码），
+        # main() 据此以非零退出码终止进程。
+        aborted_detail = str(exc)
+        print(f"    ⚠ 不变式违规，fail-fast 中止本场景：{exc}")
     wall = time.perf_counter() - wall_start
     m = engine.metrics()
+    if aborted_detail is not None:
+        m["aborted_on_invariant"] = True
+        m["invariant_detail"] = aborted_detail
     m["cars"] = cars
     m["wall_seconds"] = round(wall, 1)
     print(f"    完成 {m['tasks_completed']}/{task_total}，"
@@ -159,8 +174,9 @@ def build_report(rows, lam, task_total, seed):
                  "日常演示强度下任务即到即派，派单延迟为亚秒级。")
 
     # ---- 3. 空载行驶率 ----
-    emp_txt = " → ".join(f"{e:.1%}" for e in emp)
-    if len(rows) >= 2 and emp[-1] < emp[0]:
+    # None（如违规中止时车辆尚未移动）按 "-" 显示，保证中止场景也能出报告
+    emp_txt = " → ".join(f"{e:.1%}" if e is not None else "-" for e in emp)
+    if len(rows) >= 2 and None not in emp and emp[-1] < emp[0]:
         why = "车越多接单距离越短，空驶占比收窄"
     elif len(rows) >= 2:
         why = "任务分布与拥堵格局共同影响空驶占比，未呈单调关系"
@@ -189,11 +205,18 @@ def build_report(rows, lam, task_total, seed):
     inv = sum(r["invariant_violations"] for r in rows)
     if inv == 0:
         inv_txt = ("占格冲突计数为 0——该值来自引擎每拍执行的\"一格一车\"不变式"
-                   "断言（两车同格/占格无主/幽灵占用预约记录，违规即 fail-fast），"
-                   "是【被测量的机制保证】，而非设计推断。")
+                   "断言（两车同格/占格无主/幽灵占用预约记录，压测口径违规即 "
+                   "fail-fast），是【被测量的机制保证】，而非设计推断。")
     else:
+        # 分支已接通（复审06 N3）：strict 模式违规由 run_scenario 捕获后
+        # 带回详情，报告如实呈现违规事实与首次违规现场，不再不可达。
+        details = "；".join(
+            f"{r['cars']}台车场景：{r['invariant_detail']}"
+            for r in rows if r.get("invariant_detail"))
         inv_txt = (f"不变式断言实测违规 {inv} 次——占格冲突并非 0，"
                    "该结果不可用于宣称零对撞，需排查根因。")
+        if details:
+            inv_txt += f"首次违规现场：{details}。"
     lines.append(f"4. **死锁与重规划**：物理死锁（按环去重）{dl_txt} 起、消除 "
                  f"{rs_txt} 起；仲裁触发 {arb_txt} 次（口径=同一环冷却期后的重复"
                  f"仲裁照常计数，与\"发生/消除\"分列，不得混用）；其中让路者目标"
@@ -221,9 +244,35 @@ def build_report(rows, lam, task_total, seed):
                      "建议加跑多场景形成对比矩阵。")
     lines.append("- 若需继续提升吞吐，优先级建议：扩大双向主巷道比例 > 增加充电桩 > "
                  "引入拍卖法分配（接口已预留 `AuctionStrategy`）。")
+    # 不变式违规中止的如实披露（复审06 N3）：发生即显著标注，不与正常结果混同
+    aborted = [r for r in rows if r.get("aborted_on_invariant")]
+    if aborted:
+        names = "、".join(f"{r['cars']}台车" for r in aborted)
+        lines.append(f"- ⚠ 场景（{names}）触发\"一格一车\"不变式违规，压测按 "
+                     "strict 口径 fail-fast 中止：进程以非零退出码结束，"
+                     "上表数字仅反映中止前的实际进度，不可用于对外宣称。")
     lines.append("- 复现方式：`pip install -r requirements.txt && python run_stress.py`"
                  "（随机种子固定，表格数值应可复现）。")
     return "\n".join(lines)
+
+
+def finalize(rows, lam, task_total, seed, report_path=None):
+    """
+    渲染报告、落盘并返回进程退出码：0=全部场景正常完成，
+    1=存在不变式违规 fail-fast 中止（复审06 N3：违规必须非零退出，
+    不得以"正常结束"假象掩盖）。
+    拆出独立函数，便于回归测试在临时路径下验证"违规 → 非零退出码 +
+    报告含违规详情"的完整链路，而不触碰默认报告文件 docs/压测报告.md。
+    """
+    report = build_report(rows, lam, task_total, seed)
+    path = report_path or config.STRESS_REPORT_PATH
+    with open(path, "w", encoding="utf-8") as fp:
+        fp.write(report + "\n")
+    print(f"\n[压测] 报告已生成：{path}")
+    if any(r.get("aborted_on_invariant") for r in rows):
+        print("[压测] ⚠ 检测到不变式违规（fail-fast 中止）：进程以非零退出码 1 结束。")
+        return 1
+    return 0
 
 
 def main():
@@ -243,12 +292,14 @@ def main():
 
     rows = []
     for n in cars_list:
-        rows.append(run_scenario(n, args.tasks, args.lam, config.RANDOM_SEED))
+        row = run_scenario(n, args.tasks, args.lam, config.RANDOM_SEED)
+        rows.append(row)
+        if row.get("aborted_on_invariant"):
+            # fail-fast（复审06 N3）：违规即终止进程，不再继续后续场景；
+            # 已完成场景的指标与违规详情仍写入报告，保证可观测。
+            break
 
-    report = build_report(rows, args.lam, args.tasks, config.RANDOM_SEED)
-    with open(config.STRESS_REPORT_PATH, "w", encoding="utf-8") as fp:
-        fp.write(report + "\n")
-    print(f"\n[压测] 报告已生成：{config.STRESS_REPORT_PATH}")
+    sys.exit(finalize(rows, args.lam, args.tasks, config.RANDOM_SEED))
 
 
 if __name__ == "__main__":

@@ -23,6 +23,11 @@
   button:hover { background: #334155; }
   .stat-chip { background: #1e293b; border-radius: 6px; padding: 4px 10px;
                border: 1px solid #334155; }
+  /* 安全停机告警横幅（复审06 N3：不变式违规/引擎异常不得静默） */
+  .inv-banner { display: none; background: #7f1d1d; border: 1px solid #ef4444;
+                color: #fecaca; border-radius: 8px; padding: 8px 12px;
+                margin-bottom: 10px; font-size: 13px; font-weight: 600; }
+  .inv-banner small { color: #fca5a5; font-weight: 400; }
   .main { display: flex; gap: 14px; align-items: stretch; }
   .left { flex: 1.35; min-width: 0; }
   .right { flex: 1; min-width: 380px; max-width: 520px;
@@ -70,6 +75,12 @@
   <button onclick="stationCall(2)">ST3</button>
   <button onclick="stationCall(3)">ST4</button>
   <span class="stat-chip" id="callTip" style="color:#7dd3fc"></span>
+</div>
+
+<!-- 安全停机告警横幅（复审06 N3）：引擎违规/异常停机时显著显示，替代静默冻结 -->
+<div id="invBanner" class="inv-banner">
+  <span id="invTitle"></span><br>
+  <small id="invDetail"></small>
 </div>
 
 <div class="main">
@@ -129,9 +140,9 @@ const STATE_LABEL = {
 };
 const KIND_COLOR = { task:"#38bdf8", assign:"#facc15", done:"#34d399",
   reroute:"#fb923c", deadlock:"#f87171", charge:"#a78bfa",
-  fault:"#ef4444", info:"#94a3b8" };
+  fault:"#ef4444", violation:"#ef4444", info:"#94a3b8" };
 const KIND_LABEL = { task:"到达", assign:"分配", done:"完成", reroute:"让路",
-  deadlock:"死锁", charge:"回充", fault:"故障", info:"系统" };
+  deadlock:"死锁", charge:"回充", fault:"故障", violation:"违规", info:"系统" };
 
 /* ================= 初始化图例与图表 ================= */
 const legendEl = document.getElementById("legend");
@@ -164,11 +175,33 @@ async function poll() {
     document.getElementById("pending").textContent = latest.pending;
     document.getElementById("doneCnt").textContent =
       latest.metrics.tasks_completed;
-    updateCharts(); updateTaskTable(); updateLog();
+    updateCharts(); updateTaskTable(); updateLog(); updateHaltBanner();
   } catch (e) { /* 后端未就绪时静默重试 */ }
 }
 setInterval(poll, 500);
 poll();
+
+/* ================= 安全停机告警横幅（复审06 N3） ================= */
+/* 引擎在 realtime 模式下遇不变式违规/内部异常会安全停机（线程不死），
+   快照带 halted/halt_reason/invariant_details —— 据此显示显著横幅，
+   替代旧行为"引擎线程静默死亡 → 看板数据静默冻结"。 */
+function updateHaltBanner() {
+  if (!latest) return;
+  const banner = document.getElementById("invBanner");
+  if (!latest.halted) { banner.style.display = "none"; return; }
+  banner.style.display = "block";
+  const details = latest.invariant_details || [];
+  const last = details.length ? details[details.length - 1].message : "";
+  if (latest.halt_reason === "INVARIANT_VIOLATION") {
+    document.getElementById("invTitle").textContent =
+      "⚠ INVARIANT VIOLATION —— 不变式违规，引擎已安全停机（停止派单，车辆制动停车）";
+    document.getElementById("invDetail").textContent = last;
+  } else {
+    document.getElementById("invTitle").textContent =
+      "⚠ ENGINE ERROR —— 引擎内部异常，已安全停机待诊断";
+    document.getElementById("invDetail").textContent = last;
+  }
+}
 
 /* ================= ECharts 更新 ================= */
 function updateCharts() {

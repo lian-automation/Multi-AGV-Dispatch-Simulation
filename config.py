@@ -78,7 +78,20 @@ RESERVATION_DEPTH = 3         # 预约深度：进格前除下一格外再"软�
                               # 提前暴露行驶意图，减少路口对峙（一格一车约束不变）
 INVARIANT_CHECK = True        # 每拍校验"一格一车"不变式（两车同格/占格无主/
                               # 幽灵占用预约记录），违规计入 invariant_violations
-                              # 并 fail-fast——"零对撞"由此成为被测量的结论（P2-5）
+                              # 并按 INVARIANT_VIOLATION_MODE 处置——"零对撞"
+                              # 由此成为被测量的结论（P2-5）
+INVARIANT_VIOLATION_MODE = "auto"  # 不变式违规处置模式（复审06 N3 可观测化）：
+                              #   strict     违规即抛 AssertionError（fail-fast）——
+                              #              批处理/压测口径：进程以非零退出码终止，
+                              #              违规详情如实写入压测报告；
+                              #   observable 违规不杀引擎线程——违规详情（哪个不变式/
+                              #              哪两车/哪格/时刻）写入事件流与 metrics，
+                              #              引擎进入安全停机（不再派发新任务、车辆
+                              #              制动停车），看板显著显示
+                              #              "INVARIANT VIOLATION"而非静默冻结；
+                              #   auto       自动判定（默认）：压测（stress=True 或
+                              #              realtime=False）取 strict（语义不变），
+                              #              realtime 看板取 observable。
 DEADLOCK_CHECK_INTERVAL = 0.4 # 死锁检测周期（秒）：每隔多久在"等待图"里找一次环
 DEADLOCK_COOLDOWN_SECONDS = 3.0  # 同一死锁环的仲裁冷却期（秒）：期内不重复仲裁，防每拍空转
 DODGE_MAX_RADIUS = 6          # 空闲车让位搜索半径（BFS 步数）：由近及远找可站之格（P2-1）

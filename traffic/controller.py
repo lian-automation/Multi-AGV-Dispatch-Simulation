@@ -23,7 +23,10 @@ controller.py —— 交通管制器（本项目灵魂模块）
     C. 不变式校验 —— 让"一格一车/零对撞"成为被测量的结论
        check_invariants() 每拍校验：任意两车 pos 互异、每车脚下格必有
        归属且归属为本人、占用/预约表无幽灵记录。任一违反即计入
-       invariant_violations 并抛 AssertionError（fail-fast），
+       invariant_violations 并登记违规详情（哪个不变式/哪两车/哪格/时刻）；
+       处置分两种口径（config.INVARIANT_VIOLATION_MODE，复审06 N3）：
+       strict（压测/批处理）违规即抛 AssertionError（fail-fast），
+       observable（realtime 看板）不抛异常、由引擎安全停机并告警，
        "对撞为 0"由此从设计推断升级为运行时实测结论。
 
 并发模型说明：整个引擎运行在单线程仿真循环里，因此本控制器无需加锁；
@@ -75,6 +78,10 @@ class TrafficController:
 
         # ---------- 运行时不变式（P2-5：零对撞的测量口径）----------
         self.invariant_violations = 0        # 占格冲突/不变式违规累计（预期恒 0）
+        # 违规详情（复审06 N3 可观测化）：{time, kind, cell, agvs, message}
+        # ——哪个不变式、哪两车、哪格、时刻，供 metrics/快照/看板告警与
+        # 压测报告如实呈现（strict 模式抛错前、observable 模式停机前登记）
+        self.violation_details = []
 
     # ==================================================================
     # 一、路权管理（防对撞）
@@ -429,7 +436,7 @@ class TrafficController:
     # ==================================================================
     # 三、运行时不变式校验（"一格一车/零对撞"的被测量保证）
     # ==================================================================
-    def check_invariants(self, agvs):
+    def check_invariants(self, agvs, fail_fast=True):
         """
         每拍校验"一格一车"核心不变式（O(F)，F=车辆数）：
             1. 任意两台 AGV 的 pos 互异（物理上不允许两车同格）；
@@ -437,36 +444,66 @@ class TrafficController:
                （不存在"人站在无主格"的 ghost cell——P1-1 的破口）；
             3. 占用/预约表无幽灵记录：cell_owner/reservations 的值必须是
                在场车辆 id，且同一格的"占用者"与"预约者"不得是不同的车。
-        任一违反：先计入 invariant_violations（占格冲突测量口径），
-        再抛 AssertionError（fail-fast，配置 INVARIANT_CHECK=True 时启用）。
+
+        处置口径（复审06 N3 可观测化，模式由 config.INVARIANT_VIOLATION_MODE
+        经引擎解析，默认 auto：压测=strict、realtime 看板=observable）：
+            fail_fast=True（strict，默认）：首个违规先计入 invariant_violations
+              并登记详情，再抛 AssertionError——保持 fail-fast 强度，进程
+              以非零退出码终止，违规详情由压测脚本如实带回报告；
+            fail_fast=False（observable）：不抛异常——本轮扫出的全部违规
+              登记（计数 + violation_details + violation 事件）后返回详情
+              列表，由引擎进入安全停机并驱动看板告警，引擎线程不死。
+        无论哪种口径，违规详情（哪个不变式/哪两车/哪格/时刻）都先登记。
         """
+        found = []
+        for v in self._iter_invariant_violations(agvs):
+            self._register_violation(v)
+            found.append(v)
+            if fail_fast:
+                raise AssertionError(v["message"])
+        return found
+
+    def _iter_invariant_violations(self, agvs):
+        """
+        扫描四类不变式违规（生成器，与旧实现同序同文案）：
+        逐项产出结构化详情 {time, kind, cell, agvs, message}，不计数不抛错。
+        """
+        now = round(self.clock(), 1)
         by_pos = {}
         for a in agvs:
             other = by_pos.get(a.pos)
             if other is not None:
-                self.invariant_violations += 1
-                raise AssertionError(
-                    f"不变式违规[两车同格]：AGV{a.id} 与 AGV{other} 同在 {a.pos}")
+                yield {"time": now, "kind": "两车同格", "cell": list(a.pos),
+                       "agvs": [a.id, other],
+                       "message": f"不变式违规[两车同格]：AGV{a.id} 与 AGV{other} 同在 {a.pos}"}
             by_pos[a.pos] = a.id
             owner = self.cell_owner.get(a.pos)
             if owner != a.id:
-                self.invariant_violations += 1
-                raise AssertionError(
-                    f"不变式违规[占格无主/错主]：AGV{a.id} 站于 {a.pos}，"
-                    f"cell_owner 记录为 {owner}")
+                yield {"time": now, "kind": "占格无主/错主", "cell": list(a.pos),
+                       "agvs": [a.id],
+                       "message": f"不变式违规[占格无主/错主]：AGV{a.id} 站于 {a.pos}，"
+                                  f"cell_owner 记录为 {owner}"}
         valid_ids = {a.id for a in agvs}
         for c, oid in self.cell_owner.items():
             if oid not in valid_ids:
-                self.invariant_violations += 1
-                raise AssertionError(
-                    f"不变式违规[幽灵占用记录]：{c} 的占用者 AGV{oid} 不在场")
+                yield {"time": now, "kind": "幽灵占用记录", "cell": list(c),
+                       "agvs": [oid],
+                       "message": f"不变式违规[幽灵占用记录]：{c} 的占用者 AGV{oid} 不在场"}
         for c, bid in self.reservations.items():
             owner = self.cell_owner.get(c)
             if bid not in valid_ids or (owner is not None and owner != bid):
-                self.invariant_violations += 1
-                raise AssertionError(
-                    f"不变式违规[幽灵/冲突预约记录]：{c} 预约者 AGV{bid}，"
-                    f"占用者 {owner}")
+                yield {"time": now, "kind": "幽灵/冲突预约记录", "cell": list(c),
+                       "agvs": [bid],
+                       "message": f"不变式违规[幽灵/冲突预约记录]：{c} 预约者 AGV{bid}，"
+                                  f"占用者 {owner}"}
+
+    def _register_violation(self, violation):
+        """登记一条违规：计数累计 + 详情留档 + violation 事件（无静默）。"""
+        self.invariant_violations += 1
+        self.violation_details.append(violation)
+        if len(self.violation_details) > 100:      # 防御性截断，防长跑膨胀
+            del self.violation_details[:-100]
+        self.events.add("violation", violation["message"])
 
     # ==================================================================
     # 四、统计快照（压测报告 / 看板数据源）

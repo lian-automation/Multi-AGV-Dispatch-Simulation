@@ -24,6 +24,7 @@ dispatcher.py —— 任务分配 + A* 寻路 + 仿真引擎主循环
 import itertools
 import threading
 import time
+import traceback
 from collections import deque
 
 import numpy as np
@@ -93,7 +94,9 @@ class EventLog:
     """
     事件日志（环形缓冲）：记录 分配/让路/死锁/回充/故障/完成 等关键事件。
     kind 取值：task=任务到达, assign=派单, done=完成, reroute=让路重规划,
-              deadlock=死锁, charge=回充, fault=故障, info=系统
+              deadlock=死锁, charge=回充, fault=故障, violation=不变式违规
+              （复审06 N3 可观测化：违规详情必须进入事件流，不得静默）,
+              info=系统
     """
 
     def __init__(self, capacity=None):
@@ -336,6 +339,24 @@ class SimulationEngine:
         self.stopped = False
         self.lock = threading.RLock()   # 保护 tick/snapshot 的互斥锁
 
+        # --- 不变式违规处置模式（复审06 N3 可观测化）---
+        # strict：违规即抛 AssertionError fail-fast（压测/批处理口径，
+        #         进程非零退出码、违规详情进报告）；
+        # observable：违规登记事件流+metrics 后安全停机（realtime 看板口径，
+        #         引擎线程不死，看板显著告警而非静默冻结）；
+        # auto（config 默认）：stress 或非 realtime => strict，realtime => observable。
+        mode = config.INVARIANT_VIOLATION_MODE
+        if mode == "auto":
+            mode = "strict" if (self.stress or not self.realtime) \
+                else "observable"
+        if mode not in ("strict", "observable"):
+            raise ValueError(
+                f"INVARIANT_VIOLATION_MODE 配置非法："
+                f"{config.INVARIANT_VIOLATION_MODE}（可选 strict/observable/auto）")
+        self.invariant_mode = mode
+        self.halted = False             # 安全停机标记（observable 模式违规/异常后置位）
+        self.halt_reason = None         # 停机原因：INVARIANT_VIOLATION / ENGINE_ERROR
+
         # --- 建立车队：初始停在充电站附近空地，避免开局堵门 ---
         self.agvs = []
         spawn_cells = self._pick_spawn_cells(self.fleet_size)
@@ -397,12 +418,35 @@ class SimulationEngine:
     # 主循环
     # ------------------------------------------------------------------
     def run(self):
-        """阻塞式主循环：realtime 模式按墙钟对齐节拍，压测模式全速跑。"""
+        """
+        阻塞式主循环：realtime 模式按墙钟对齐节拍，压测模式全速跑。
+
+        异常纪律（复审06 N3）：strict（压测/批处理）模式任何异常原样上抛
+        ——fail-fast、进程非零退出；observable（realtime 看板）模式下
+        未预期异常不得静默杀死引擎线程（那会表现为看板静默冻结）——
+        登记 fault 事件并进入安全停机节拍，看板保持可见、可诊断。
+        """
         start_wall = time.monotonic()
         ticks = 0
         while not self.stopped and self.sim_time < config.MAX_SIM_SECONDS:
-            with self.lock:
-                self.tick(config.DT)
+            try:
+                with self.lock:
+                    self.tick(config.DT)
+            except Exception as exc:
+                if self.invariant_mode != "observable":
+                    raise                       # strict：fail-fast 原样上抛
+                if not self.halted:
+                    self._enter_safe_stop("ENGINE_ERROR")
+                    self.events.add(
+                        "fault", f"⚠ 引擎内部异常，已安全停机待诊断："
+                                 f"{type(exc).__name__}: {exc}")
+                    traceback.print_exc()       # 完整堆栈进控制台日志，现场可排查
+                else:
+                    # 停机节拍中仍异常（双重故障）：如实登记后退出循环，防忙旋
+                    self.events.add(
+                        "fault", f"⚠ 安全停机节拍仍异常，引擎退出："
+                                 f"{type(exc).__name__}: {exc}")
+                    self.stopped = True
             if self.realtime:
                 target = start_wall + (ticks + 1) * config.DT
                 sleep_for = target - time.monotonic()
@@ -416,6 +460,9 @@ class SimulationEngine:
     def tick(self, dt):
         """推进一步仿真（顺序见注释——先产生需求，再决策，再执行，再管制）。"""
         if self.paused:
+            return
+        if self.halted:
+            self._tick_halted(dt)       # 安全停机态：可观测的受控停机（N3）
             return
         self.sim_time += dt
 
@@ -447,12 +494,62 @@ class SimulationEngine:
                     agv.fault_reset_at = None
                     self.events.add("fault", f"AGV{agv.id} 已复位（压测等效人工处理），恢复作业")
 
-        # 7) 运行时不变式校验（P2-5）："一格一车/零对撞"从设计推断升级为
-        #    每拍实测——任一违规计入 invariant_violations 并 fail-fast
-        if config.INVARIANT_CHECK:
-            self.traffic.check_invariants(self.agvs)
+        # 7) 运行时不变式校验（P2-5；处置口径 config.INVARIANT_VIOLATION_MODE，
+        #    复审06 N3 可观测化）：
+        #    - strict（压测/批处理，默认语义不变）：违规即抛 AssertionError
+        #      fail-fast，压测脚本捕获后如实写入报告并以非零退出码终止；
+        #    - observable（realtime 看板，默认语义）：违规登记事件流与 metrics
+        #      后进入安全停机（不再派发新任务、车辆制动停车），引擎线程不死、
+        #      看板显著显示 INVARIANT VIOLATION 而非静默冻结。
+        if config.INVARIANT_CHECK and not self.halted:
+            if self.invariant_mode == "strict":
+                self.traffic.check_invariants(self.agvs, fail_fast=True)
+            else:
+                violations = self.traffic.check_invariants(self.agvs,
+                                                           fail_fast=False)
+                if violations:
+                    self._enter_safe_stop("INVARIANT_VIOLATION",
+                                          detail=violations[0]["message"])
 
         # 8) 指标采样（吞吐曲线 / 平均响应曲线）
+        self._sample_metrics(dt)
+
+    # ------------------------------------------------------------------
+    # 安全停机（复审06 N3：observable 模式的违规/异常处置——停机不静默）
+    # ------------------------------------------------------------------
+    def _enter_safe_stop(self, reason, detail=None):
+        """
+        进入安全停机：不再生成/派发任务、不再做死锁仲裁，全部车辆制动停车
+        （收回全部进格预约、取消在途跨格动作、清空待走路径，停在当前格）。
+
+        与"静默冻结"的本质区别：引擎线程不退出，_tick_halted 继续推进时钟
+        与指标采样，快照/事件流持续更新；违规/异常详情已登记事件流，
+        看板据 halted/halt_reason 显示显著告警横幅。
+        """
+        self.halted = True
+        self.halt_reason = reason
+        for agv in self.agvs:
+            self.traffic.release_reservations(agv)   # 收回全部进格预约（含在途格）
+            agv.next_cell = None                     # 取消在途跨格动作
+            agv.move_progress = 0.0
+            agv.path = []                            # 清空待走路径
+        if detail is not None:
+            self.events.add(
+                "violation",
+                f"⚠ INVARIANT VIOLATION：{detail}——引擎安全停机："
+                f"停止派发新任务，全部车辆制动停车")
+        else:
+            self.events.add(
+                "fault",
+                f"⚠ 引擎安全停机（{reason}）：停止派发新任务，全部车辆制动停车")
+
+    def _tick_halted(self, dt):
+        """
+        安全停机态的节拍：时钟与指标采样继续（吞吐曲线可见"停机后走平"，
+        证明引擎线程存活、看板非静默冻结）；不再有任何车辆运动、任务派发
+        与死锁仲裁（复审06 N3）。
+        """
+        self.sim_time += dt
         self._sample_metrics(dt)
 
     # ------------------------------------------------------------------
@@ -716,6 +813,8 @@ class SimulationEngine:
             "dodge_detours": ts["dodge_detours"],  # 仲裁升级侧避改道次数（N1）
             "unresolved_waits": ts["unresolved_waits"],
             "invariant_violations": ts["invariant_violations"],  # 占格冲突实测计数
+            # 违规详情（复审06 N3 可观测化）：哪个不变式/哪两车/哪格/时刻
+            "invariant_violation_details": list(self.traffic.violation_details[-3:]),
             "replan_count": ts["reroute_total"],  # 全网唯一口径：拥堵绕行+死锁让路
             "low_battery_events": self.low_battery_events,
             "recharge_success": recharge_ok,
@@ -732,6 +831,11 @@ class SimulationEngine:
             return {
                 "sim_time": round(self.sim_time, 1),
                 "paused": self.paused,
+                # 安全停机状态（复审06 N3）：看板据此显示显著告警横幅，
+                # 替代旧行为里"引擎线程死亡 → 看板静默冻结"
+                "halted": self.halted,
+                "halt_reason": self.halt_reason,
+                "invariant_details": list(self.traffic.violation_details[-5:]),
                 "map": {
                     "cols": self.map.cols,
                     "rows": self.map.rows,
