@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax check (compileall)
+        run: python -m compileall -q config.py main.py run_stress.py map simulator dispatch traffic plc_link dashboard tests
+
+      - name: Unit tests (17 cases)
+        run: python -m unittest discover tests
+
+      - name: Stress smoke (3 cars x 30 tasks)
+        run: python run_stress.py --cars 3 --tasks 30

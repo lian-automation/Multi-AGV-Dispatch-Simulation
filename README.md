@@ -1,5 +1,9 @@
 # 多 AGV 调度与交通管制仿真
 
+[![CI](https://github.com/lwj15089590118/Multi-AGV-Dispatch-Simulation/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lwj15089590118/Multi-AGV-Dispatch-Simulation/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green.svg)
+
 > 电气自动化应届生求职作品集项目 · 纯软件调度层仿真
 > Windows 10 + Python 3.12 | 仅用 numpy / flask / pymodbus（全开源免费）| 前端 ECharts(CDN) + 原生 Canvas
 
@@ -14,6 +18,18 @@
 所有性能指标均为**仿真验证值**，不代表实车现场表现。
 
 ---
+
+## 🖼️ 运行实况（引擎实测数据渲染，非示意图）
+
+![AGV轨迹图](docs/img/agv_trajectory.png)
+
+*5 车 × 200 任务（泊松 λ=0.6/s，种子 20240601，与压测报告 5 车场景同参数）一次真实运行的逐拍轨迹：
+灰块=货架、浅蓝带=单向环流巷道、绿=站台×4、橙=充电站×2，全部 200/200 完成。*
+
+![吞吐曲线](docs/img/throughput_curve.png)
+
+*同一次运行的累计完成任务曲线：仿真 1911 s 吞吐 ≈ 6.28 个/min，
+与 [docs/压测报告.md](docs/压测报告.md) 5 车口径 6.27 吻合（同种子可复现）。*
 
 ## 快速开始
 
@@ -61,6 +77,7 @@ dashboard/templates/index.html   Canvas 动画 + ECharts 图表 + 任务表 + �
 tests/test_regression.py  最小回归测试（原地接单/ghost cell/死锁计数去重/不变式）
 docs/系统设计说明书.md      架构 mermaid 图 + A*/路权/死锁算法详解
 docs/压测报告.md           run_stress.py 自动生成的对比报告
+docs/img/                 运行实况图（引擎实测数据渲染）
 resume/                   项目总结 / 简历描述 / 面试问答10题
 ```
 
@@ -108,6 +125,51 @@ resume/                   项目总结 / 简历描述 / 面试问答10题
 - ✅ Modbus/TCP 从站模拟 4 站台呼叫盒（HR0~3 / HR10~13 / HR20 心跳）+ 自测脚本；
 - ✅ Web 看板：Canvas 实时动画、点选详情、ECharts 吞吐/响应/电量三图、
   任务队列实时表、彩色事件日志（分配/让路/死锁/回充/故障）。
+
+## FAQ（复审与答辩高频问题）
+
+**Q1：怎么保证"一格一车"？零对撞是保证还是观测？**
+机制保证 + 实测双重口径：`traffic/controller.py` 的 `check_invariants()` 由引擎
+每拍断言三条不变式（任意两车 pos 互异 / 每车脚下格必有占用登记 / 登记值域合法），
+压测 strict 口径违规即 fail-fast、进程非零退出。三场景 × 200 任务的占格冲突
+实测计数为 **0 / 0 / 0**——是被测量的结论，不是设计推断。
+
+**Q2：ghost cell 是什么？怎么根治的？**
+指"车还站在格上、占用表却为空"的幽灵格——其他车会误判该格可驶入，实际将两车同格。
+复审06 曾实证"原地接单"路径可产生它，现按三层守卫根治：
+①接单层：退化路径 `[pos]` 归一化为空路径，不发起伪移动（`simulator/agv.py`）；
+②派单层：分配前断言接单车 `cell_owner==本人`，脱钩即拒绝派单（`dispatch/dispatcher.py`）；
+③落格层：`commit_arrival` 对 old==new 不删占用记录（`traffic/controller.py`）；
+另有每拍 `check_invariants` 兜底（见 Q1）。
+
+**Q3：死锁了怎么办？能保证全部解开吗？**
+等待环 DFS 找圈 → 低优先级车让路重规划；让路者目标格被互等方占用时，
+升级"先侧避再回原目标"改道破环（复审06 N1 根治）。**不宣称全部可解**：
+让路无解/无侧避格的环按 unresolved 如实计数上报（3/5/8 车实测 1/2/4 个），
+按原地等待处理并写入压测报告。
+
+**Q4：压测响应时间几百秒，是不是卡顿？**
+口径问题：压测刻意用突发注单制造饱和排队，响应时间=到达→分配（含排队等待）；
+日常演示模式（λ=0.3、5 车）任务即到即派，看板实测亚秒级。
+吞吐-排队的守恒关系见"性能指标"节口径说明。
+
+**Q5：怎么复现这些数字？**
+`python -m unittest discover tests` 跑 17 条回归/不变式用例；
+`python run_stress.py` 复现压测矩阵（种子固定 20240601，结果可复现）；
+CI（`.github/workflows/ci.yml`）在每次 push 自动执行
+compileall + 全部单测 + 3 车×30 任务压测冒烟。
+
+**Q6：车没电 / 故障了怎么办？**
+电量 <20% 自动回最近充电站、充满归队（3/5 车场景回充成功率实测 100%，
+8 车未触发属正常披露）；每任务 1% 概率故障注入，看板点选故障车"人工复位"恢复。
+
+## Roadmap（真实规划 = 复审06 残留项）
+
+- [ ] 拍卖法任务分配 `AuctionStrategy`（`dispatch/dispatcher.py` 接口已预留，压测报告建议的提吞吐手段）；
+- [ ] `config.INIT_PARK_CELLS` 优先消费 + 前端轮询间隔经 `render_template` 注入（复审06 P3-3：现为死配置 / 前端硬编码 500ms）；
+- [ ] Modbus 自测客户端超时按任务完成事件自适应（复审06 P3-6：现固定 30s，挂接引擎高负载时可能误报 FAIL）；
+- [ ] 统计口径与工程细节打磨（复审06 P3-8：pending 队列改 deque、冷却表随环消失清理等）；
+- [ ] 引擎 4h 安全上限到期前写事件日志提示或提供 `--max-hours`（复审06 P3-9：现静默自停）。
 
 ## 免责声明
 
