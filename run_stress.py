@@ -60,7 +60,7 @@ def run_scenario(cars, task_total, lam, seed, engine=None):
                           f"以当前进度收尾（完成 {done} 个）")
                     break
     except AssertionError as exc:
-        # strict fail-fast（复审06 N3）：不变式违规即中止本场景——异常仍由
+        # strict fail-fast（可观测化改造）：不变式违规即中止本场景——异常仍由
         # 引擎抛出（fail-fast 强度不变），脚本在此捕获以把违规详情如实带回
         # 报告（inv>0 报告分支由此接通，不再是不可达死代码），
         # main() 据此以非零退出码终止进程。
@@ -134,7 +134,7 @@ def build_report(rows, lam, task_total, seed):
     row("**死锁发生次数（按环去重的物理死锁数）**", "deadlock_detected")
     row("**死锁消除次数（环消失）**", "deadlock_resolved")
     row("仲裁触发次数（冷却期后每次实际执行，同一环可重复）", "deadlock_arbitrations")
-    row("仲裁升级侧避改道次数（目标被堵假成功根治，复审06 N1）", "dodge_detours")
+    row("仲裁升级侧避改道次数（目标被堵假成功根治，仲裁自旋修复）", "dodge_detours")
     row("让路无解/不可解的物理死锁环数（按环首次判定计）", "unresolved_waits")
     row("**让路重规划次数**", "replan_count")
     row("**占格冲突/不变式违规（每拍实测）**", "invariant_violations")
@@ -185,7 +185,7 @@ def build_report(rows, lam, task_total, seed):
     lines.append(f"3. **空载行驶率**：{emp_txt}。{why}。")
 
     # ---- 4. 死锁与重规划：按环去重的物理死锁口径 + 被测量的占格冲突 ----
-    # 口径分列（复审06 N2）：物理死锁数（按环去重的"发生"）、环消失数（"消除"）、
+    # 口径分列（口径修正）：物理死锁数（按环去重的"发生"）、环消失数（"消除"）、
     # 仲裁触发次数（冷却期门控后每次实际执行，同一环可重复触发）三者互不相同，
     # 不得混用——旧口径曾把 2176 次仲裁误报为 2176 起死锁。
     dl = [r["deadlock_detected"] for r in rows]
@@ -197,7 +197,7 @@ def build_report(rows, lam, task_total, seed):
     rs_txt = " / ".join(str(v) for v in rs)
     arb_txt = " / ".join(str(v) for v in arb)
     esc_txt = " / ".join(str(v) for v in esc)
-    # "全部环已消解"的结论只有在 unresolved==0 时才允许输出（复审06 N2 门控）
+    # "全部环已消解"的结论只有在 unresolved==0 时才允许输出（口径门控）
     tail = (f"{unres} 个环判定为不可解环（让路无解或目标被堵且无侧避格），"
             "按原地等待处理并已计入上报"
             if unres else
@@ -208,7 +208,7 @@ def build_report(rows, lam, task_total, seed):
                    "断言（两车同格/占格无主/幽灵占用预约记录，压测口径违规即 "
                    "fail-fast），是【被测量的机制保证】，而非设计推断。")
     else:
-        # 分支已接通（复审06 N3）：strict 模式违规由 run_scenario 捕获后
+        # 分支已接通（可观测化改造）：strict 模式违规由 run_scenario 捕获后
         # 带回详情，报告如实呈现违规事实与首次违规现场，不再不可达。
         details = "；".join(
             f"{r['cars']}台车场景：{r['invariant_detail']}"
@@ -244,7 +244,7 @@ def build_report(rows, lam, task_total, seed):
                      "建议加跑多场景形成对比矩阵。")
     lines.append("- 若需继续提升吞吐，优先级建议：扩大双向主巷道比例 > 增加充电桩 > "
                  "引入拍卖法分配（接口已预留 `AuctionStrategy`）。")
-    # 不变式违规中止的如实披露（复审06 N3）：发生即显著标注，不与正常结果混同
+    # 不变式违规中止的如实披露（可观测化改造）：发生即显著标注，不与正常结果混同
     aborted = [r for r in rows if r.get("aborted_on_invariant")]
     if aborted:
         names = "、".join(f"{r['cars']}台车" for r in aborted)
@@ -259,7 +259,7 @@ def build_report(rows, lam, task_total, seed):
 def finalize(rows, lam, task_total, seed, report_path=None):
     """
     渲染报告、落盘并返回进程退出码：0=全部场景正常完成，
-    1=存在不变式违规 fail-fast 中止（复审06 N3：违规必须非零退出，
+    1=存在不变式违规 fail-fast 中止（可观测化改造：违规必须非零退出，
     不得以"正常结束"假象掩盖）。
     拆出独立函数，便于回归测试在临时路径下验证"违规 → 非零退出码 +
     报告含违规详情"的完整链路，而不触碰默认报告文件 docs/压测报告.md。
@@ -295,7 +295,7 @@ def main():
         row = run_scenario(n, args.tasks, args.lam, config.RANDOM_SEED)
         rows.append(row)
         if row.get("aborted_on_invariant"):
-            # fail-fast（复审06 N3）：违规即终止进程，不再继续后续场景；
+            # fail-fast（可观测化改造）：违规即终止进程，不再继续后续场景；
             # 已完成场景的指标与违规详情仍写入报告，保证可观测。
             break
 

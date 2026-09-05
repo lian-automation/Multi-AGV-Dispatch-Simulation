@@ -10,10 +10,10 @@ test_regression.py —— 最小回归测试（审查报告06 · 路线图第6�
     3. 不变式校验器：注入"两车同格 / 占格无主"违规必须被捕获（fail-fast）；
     4. P2-3 回归：同一物理死锁环持续存在时 deadlock_detected 去重，
        仲裁触发按冷却期照常累加，环消失才计"消除"；
-    5. 复审06 N1 回归：让路者 goal 恰为被堵格（互等方脚下格）时，
+    5. 仲裁自旋修复 回归：让路者 goal 恰为被堵格（互等方脚下格）时，
        仲裁不得凭 A* 终点豁免的"假成功"路径无限自旋——必须有限时间内
        破环（升级侧避改道）或如实计入 unresolved 上报；
-    6. 复审06 N3 回归：不变式违规的可观测化处置——压测/批处理（strict）
+    6. 可观测化改造 回归：不变式违规的可观测化处置——压测/批处理（strict）
        违规 fail-fast 中止、报告如实写入违规详情、进程非零退出码；
        realtime 看板（observable）违规不杀引擎线程：violation 事件入流、
        引擎安全停机（不再派单、车辆制动停车）、快照可见告警状态。
@@ -176,7 +176,7 @@ class DeadlockCountDedup(unittest.TestCase):
 
 
 class DodgeGoalBlockedSpin(unittest.TestCase):
-    """复审06 N1 回归：让路者 goal 恰为被堵格时的仲裁自旋。
+    """仲裁自旋修复 回归：让路者 goal 恰为被堵格时的仲裁自旋。
 
     场景：对头互等且互为目标——AGV1 的 goal=AGV2 脚下格，反之亦然。
     旧缺陷下，让路重规划因 A* 终点豁免恒返回同一条 1 步路径并被判"成功"，
@@ -256,7 +256,7 @@ class DodgeGoalBlockedSpin(unittest.TestCase):
 
 
 class InvariantViolationObservability(unittest.TestCase):
-    """复审06 N3 回归：不变式违规的可观测化处置。
+    """可观测化改造 回归：不变式违规的可观测化处置。
 
     旧行为的两处问题：① realtime 模式违规抛 AssertionError 直接杀死引擎
     线程——看板静默冻结（无日志无提示）；② 压测报告 inv>0 分支因违规即

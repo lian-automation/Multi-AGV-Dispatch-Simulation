@@ -95,7 +95,7 @@ class EventLog:
     事件日志（环形缓冲）：记录 分配/让路/死锁/回充/故障/完成 等关键事件。
     kind 取值：task=任务到达, assign=派单, done=完成, reroute=让路重规划,
               deadlock=死锁, charge=回充, fault=故障, violation=不变式违规
-              （复审06 N3 可观测化：违规详情必须进入事件流，不得静默）,
+              （可观测化改造：违规详情必须进入事件流，不得静默）,
               info=系统
     """
 
@@ -339,7 +339,7 @@ class SimulationEngine:
         self.stopped = False
         self.lock = threading.RLock()   # 保护 tick/snapshot 的互斥锁
 
-        # --- 不变式违规处置模式（复审06 N3 可观测化）---
+        # --- 不变式违规处置模式（可观测化改造）---
         # strict：违规即抛 AssertionError fail-fast（压测/批处理口径，
         #         进程非零退出码、违规详情进报告）；
         # observable：违规登记事件流+metrics 后安全停机（realtime 看板口径，
@@ -421,7 +421,7 @@ class SimulationEngine:
         """
         阻塞式主循环：realtime 模式按墙钟对齐节拍，压测模式全速跑。
 
-        异常纪律（复审06 N3）：strict（压测/批处理）模式任何异常原样上抛
+        异常纪律（可观测化改造）：strict（压测/批处理）模式任何异常原样上抛
         ——fail-fast、进程非零退出；observable（realtime 看板）模式下
         未预期异常不得静默杀死引擎线程（那会表现为看板静默冻结）——
         登记 fault 事件并进入安全停机节拍，看板保持可见、可诊断。
@@ -495,7 +495,7 @@ class SimulationEngine:
                     self.events.add("fault", f"AGV{agv.id} 已复位（压测等效人工处理），恢复作业")
 
         # 7) 运行时不变式校验（P2-5；处置口径 config.INVARIANT_VIOLATION_MODE，
-        #    复审06 N3 可观测化）：
+        #    可观测化改造）：
         #    - strict（压测/批处理，默认语义不变）：违规即抛 AssertionError
         #      fail-fast，压测脚本捕获后如实写入报告并以非零退出码终止；
         #    - observable（realtime 看板，默认语义）：违规登记事件流与 metrics
@@ -515,7 +515,7 @@ class SimulationEngine:
         self._sample_metrics(dt)
 
     # ------------------------------------------------------------------
-    # 安全停机（复审06 N3：observable 模式的违规/异常处置——停机不静默）
+    # 安全停机（可观测化改造：observable 模式的违规/异常处置——停机不静默）
     # ------------------------------------------------------------------
     def _enter_safe_stop(self, reason, detail=None):
         """
@@ -547,7 +547,7 @@ class SimulationEngine:
         """
         安全停机态的节拍：时钟与指标采样继续（吞吐曲线可见"停机后走平"，
         证明引擎线程存活、看板非静默冻结）；不再有任何车辆运动、任务派发
-        与死锁仲裁（复审06 N3）。
+        与死锁仲裁（可观测化改造）。
         """
         self.sim_time += dt
         self._sample_metrics(dt)
@@ -592,7 +592,7 @@ class SimulationEngine:
                                 f"AGV{agv.id} 前方被占，自动重规划"
                                 f"（改走 {len(new_path)-1} 步）")
             elif new_path is not None and len(new_path) - 1 > 0:
-                # 假成功路径不装载（复审06 N1 同源修复）：新路径首格仍被其他车
+                # 假成功路径不装载（仲裁自旋修复 同源修复）：新路径首格仍被其他车
                 # 占/预约（典型：终点豁免使 goal 被堵时恒返回同一条直达路径），
                 # 装载后下一拍仍原地被拒，纯属空转——计入连续重规划上限，
                 # 交由死锁仲裁按"目标被堵"分支升级处理。
@@ -813,7 +813,7 @@ class SimulationEngine:
             "dodge_detours": ts["dodge_detours"],  # 仲裁升级侧避改道次数（N1）
             "unresolved_waits": ts["unresolved_waits"],
             "invariant_violations": ts["invariant_violations"],  # 占格冲突实测计数
-            # 违规详情（复审06 N3 可观测化）：哪个不变式/哪两车/哪格/时刻
+            # 违规详情（可观测化改造）：哪个不变式/哪两车/哪格/时刻
             "invariant_violation_details": list(self.traffic.violation_details[-3:]),
             "replan_count": ts["reroute_total"],  # 全网唯一口径：拥堵绕行+死锁让路
             "low_battery_events": self.low_battery_events,
@@ -831,7 +831,7 @@ class SimulationEngine:
             return {
                 "sim_time": round(self.sim_time, 1),
                 "paused": self.paused,
-                # 安全停机状态（复审06 N3）：看板据此显示显著告警横幅，
+                # 安全停机状态（可观测化改造）：看板据此显示显著告警横幅，
                 # 替代旧行为里"引擎线程死亡 → 看板静默冻结"
                 "halted": self.halted,
                 "halt_reason": self.halt_reason,

@@ -80,7 +80,7 @@ INVARIANT_CHECK = True        # 每拍校验"一格一车"不变式（两车同�
                               # 幽灵占用预约记录），违规计入 invariant_violations
                               # 并按 INVARIANT_VIOLATION_MODE 处置——"零对撞"
                               # 由此成为被测量的结论（P2-5）
-INVARIANT_VIOLATION_MODE = "auto"  # 不变式违规处置模式（复审06 N3 可观测化）：
+INVARIANT_VIOLATION_MODE = "auto"  # 不变式违规处置模式（可观测化改造）：
                               #   strict     违规即抛 AssertionError（fail-fast）——
                               #              批处理/压测口径：进程以非零退出码终止，
                               #              违规详情如实写入压测报告；

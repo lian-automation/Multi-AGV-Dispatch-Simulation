@@ -16,7 +16,7 @@ controller.py —— 交通管制器（本项目灵魂模块）
          谁也不肯动 => 这就是死锁（对应死锁四必要条件中的"循环等待"）;
        - 解除：优先选"目标格未被堵"的环内车作为让路者，回收其全部预约后
          按"避开其他车占/预约格"重新 A*，且新路径首格必须当前可通行
-         （有效性判据，防终点豁免造成的"假成功"重规划空转——复审06 N1）；
+         （有效性判据，防终点豁免造成的"假成功"重规划空转——仲裁自旋修复）；
          目标恰被堵时升级为"先侧避再回原目标"的改道；侧避也无解才判
          "不可解环"，原地等待并按环首次判定计数上报（unresolved_waits）。
 
@@ -24,7 +24,7 @@ controller.py —— 交通管制器（本项目灵魂模块）
        check_invariants() 每拍校验：任意两车 pos 互异、每车脚下格必有
        归属且归属为本人、占用/预约表无幽灵记录。任一违反即计入
        invariant_violations 并登记违规详情（哪个不变式/哪两车/哪格/时刻）；
-       处置分两种口径（config.INVARIANT_VIOLATION_MODE，复审06 N3）：
+       处置分两种口径（config.INVARIANT_VIOLATION_MODE，可观测化改造）：
        strict（压测/批处理）违规即抛 AssertionError（fail-fast），
        observable（realtime 看板）不抛异常、由引擎安全停机并告警，
        "对撞为 0"由此从设计推断升级为运行时实测结论。
@@ -66,7 +66,7 @@ class TrafficController:
         self.unresolved_waits = 0            # 发生过"让路无解原地等待"的物理死锁数
         self.reroute_total = 0               # 让路重规划执行总次数
         self.dodge_detours = 0               # 仲裁升级：让路者目标被堵而"先侧避再回
-                                             # 原目标"的改道次数（复审06 N1 根治观测量）
+                                             # 原目标"的改道次数（仲裁自旋根治观测量）
 
         # 检测节奏与仲裁状态
         self._check_timer = 0.0
@@ -78,7 +78,7 @@ class TrafficController:
 
         # ---------- 运行时不变式（P2-5：零对撞的测量口径）----------
         self.invariant_violations = 0        # 占格冲突/不变式违规累计（预期恒 0）
-        # 违规详情（复审06 N3 可观测化）：{time, kind, cell, agvs, message}
+        # 违规详情（可观测化改造）：{time, kind, cell, agvs, message}
         # ——哪个不变式、哪两车、哪格、时刻，供 metrics/快照/看板告警与
         # 压测报告如实呈现（strict 模式抛错前、observable 模式停机前登记）
         self.violation_details = []
@@ -209,13 +209,13 @@ class TrafficController:
                （防止每拍空转刷计数）；
             2. 让路者优先级：剩余路径最长的车先让（离目标最远、绕行代价最小）；
                且优先选"目标格未被堵"的候选——目标恰为被堵格的车重规划会因
-               A* 终点豁免而"假成功"，指派它让路无法破环（复审06 N1 根治）；
+               A* 终点豁免而"假成功"，指派它让路无法破环（仲裁自旋根治）；
                若反复失败则按轮换游标换一辆，避免永远盯死同一辆造成活锁；
             3. 渐进松弛重规划：
                第1次 避开其他车的占用格+预约格（严格，不打扰任何人）；
                第2次 只避占用格（允许借道别人"已预约但尚未进入"的格子——
                      真正进格时仍要过 request_cell 路权审查，安全不受影响）；
-            4. 有效性判据与升级（复审06 N1 根治）：重规划"成功"必须以
+            4. 有效性判据与升级（仲裁自旋根治）：重规划"成功"必须以
                "装载后下一步即能获得路权"为准——新路径首格仍被其他车占/预约
                （终点豁免的典型假成功）不得直接装载，升级为"先侧避空格、
                再回原目标"的改道；侧避也无解才判"不可解环"，原地等待并
@@ -258,7 +258,7 @@ class TrafficController:
         self.arbitration_total += 1
 
         # ---- 选让路者：按"剩余路径最长"优先排序 + 轮换游标防活锁 ----
-        # 复审06 N1 根治：优先在"目标格当前未被其他车占/预约"的候选中轮换
+        # 仲裁自旋根治：优先在"目标格当前未被其他车占/预约"的候选中轮换
         # （目标被堵者的重规划会因终点豁免而假成功，指派它无法破环）；
         # 全员目标被堵（对头互等）才退回全集轮换，由下面的升级改道破环。
         ordered = sorted(cycle, key=lambda i: len(by_id[i].path), reverse=True)
@@ -299,7 +299,7 @@ class TrafficController:
                             f"死锁仲裁：AGV{victim} 让路重规划"
                             f"（新路径 {len(new_path)-1} 步），等待环待消解")
         elif new_path is not None and len(new_path) > 1:
-            # ---- 假成功重规划的升级处理（复审06 N1 根治）----
+            # ---- 假成功重规划的升级处理（仲裁自旋根治）----
             # 新路径首格当前仍被其他车占/预约——典型：goal 恰为互等方的脚下格，
             # A* 终点豁免使重规划恒返回同一条直达路径；直接装载则下一拍仍原地
             # 被拒、等待关系不变，仲裁按冷却期无限自旋而环永不消。
@@ -322,7 +322,7 @@ class TrafficController:
             self._mark_unresolved(cycle, key, victim, "让路重规划两档均无解")
 
     # ------------------------------------------------------------------
-    # 仲裁辅助（复审06 N1 根治引入）
+    # 仲裁辅助（仲裁自旋根治引入）
     # ------------------------------------------------------------------
     def _goal_blocked_by_others(self, agv):
         """候选让路者的当前目标格是否恰好被其他车占用/预约（被堵格/环内格）。"""
@@ -334,7 +334,7 @@ class TrafficController:
 
     def first_step_grantable(self, agv, path):
         """
-        重规划有效性判据（复审06 N1）：
+        重规划有效性判据（仲裁自旋修复）：
         path 为含起点的完整路径（find_path 口径），检查装载后首个待走格
         （path[1]）当前能否获得路权（未被其他车占用/预约）。
         False => 装载后下一拍仍原地被拒、等待关系不变，属"假成功"重规划，
@@ -385,7 +385,7 @@ class TrafficController:
     def _mark_unresolved(self, cycle, key, victim, reason):
         """
         不可解环上报：按环首次判定计 1 次 unresolved_waits（P2-3 去重口径），
-        并发出显著告警事件（复审06 N1/N2：自旋/无解不得静默，
+        并发出显著告警事件（仲裁自旋与口径修正：自旋/无解不得静默，
         杜绝"全部环已消解"的失真结论）。
         """
         entry = self._active_cycles.get(key)
@@ -445,7 +445,7 @@ class TrafficController:
             3. 占用/预约表无幽灵记录：cell_owner/reservations 的值必须是
                在场车辆 id，且同一格的"占用者"与"预约者"不得是不同的车。
 
-        处置口径（复审06 N3 可观测化，模式由 config.INVARIANT_VIOLATION_MODE
+        处置口径（可观测化改造，模式由 config.INVARIANT_VIOLATION_MODE
         经引擎解析，默认 auto：压测=strict、realtime 看板=observable）：
             fail_fast=True（strict，默认）：首个违规先计入 invariant_violations
               并登记详情，再抛 AssertionError——保持 fail-fast 强度，进程
