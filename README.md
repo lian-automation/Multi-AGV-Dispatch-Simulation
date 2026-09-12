@@ -1,6 +1,6 @@
 # 多 AGV 调度与交通管制仿真
 
-[![CI](https://github.com/lwj15089590118/Multi-AGV-Dispatch-Simulation/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lwj15089590118/Multi-AGV-Dispatch-Simulation/actions/workflows/ci.yml)
+[![CI](https://github.com/lian-automation/Multi-AGV-Dispatch-Simulation/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lian-automation/Multi-AGV-Dispatch-Simulation/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 
