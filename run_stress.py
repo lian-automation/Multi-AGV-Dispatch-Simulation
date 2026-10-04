@@ -31,6 +31,15 @@ import config
 from dispatch.dispatcher import SimulationEngine
 from map.grid_map import load_map
 
+# Windows 控制台中文/符号防乱码：本模块既可 `python run_stress.py` 运行，
+# 也会被回归测试 `import run_stress` 后直接调用 run_scenario()——后者不经过
+# main()，因此保护必须放在模块级，否则 GBK 控制台下打印 "⚠" 会抛
+# UnicodeEncodeError 把用例打成 error（与本仓 main.py 的既有范式一致）。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 
 def run_scenario(cars, task_total, lam, seed, engine=None):
     """
