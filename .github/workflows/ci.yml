@@ -26,6 +26,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Lint (ruff, baseline E4/E7/E9/F)
+
+
+        run: |
+
+
+          pip install ruff
+
+
+          python -m ruff check .
+
+
       - name: Syntax check (compileall)
         run: python -m compileall -q config.py main.py run_stress.py map simulator dispatch traffic plc_link dashboard tests
 

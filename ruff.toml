@@ -1,0 +1,15 @@
+# Multi-AGV-Dispatch-Simulation 工程工具链配置（ruff 静态检查）
+# =========================================================
+# 说明：本仓库是脚本型项目（无打包发布需求），此文件只承载工具配置。
+# 基线与旗舰仓对齐：E4/E7/E9（语法与明显错误）+ F（未用导入/未定义名/未用变量）。
+
+line-length = 140                 # 宽松行宽：存量代码中文注释较长，不做全量重排
+target-version = "py312"
+extend-exclude = [".venv", "venv", "docs", "logs", "reports", "__pycache__"]
+
+[lint]
+# 与 ruff 默认一致的基线：只看语法与明显错误，不做全量风格重排。
+select = ["E4", "E7", "E9", "F"]
+# E402（import 不在文件顶部）在本项目是刻意的路径引导写法：
+# 脚本允许 python xxx/app.py 直接运行，必须先 sys.path.insert 再 import 子包。
+ignore = ["E402"]
